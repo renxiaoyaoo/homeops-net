@@ -9,10 +9,6 @@ This is a public example for the standard HomeNet profile.
 First pass:
 
 ```sh
-./homenet quickstart --instance instances/example-openwrt-pi
-./homenet inputs --instance instances/example-openwrt-pi
-./homenet secrets --instance instances/example-openwrt-pi
-./homenet adopt --instance instances/example-openwrt-pi
 ./homenet deploy --instance instances/example-openwrt-pi --force --check-idempotent
 ./homenet check --instance instances/example-openwrt-pi
 ```
@@ -22,6 +18,7 @@ Review before live changes:
 ```sh
 ./homenet status --instance instances/example-openwrt-pi
 ./homenet runbook --instance instances/example-openwrt-pi
+./homenet deploy --instance instances/example-openwrt-pi --dry-run
 ./homenet rollback --instance instances/example-openwrt-pi
 ./homenet apply --instance instances/example-openwrt-pi --dry-run
 ```

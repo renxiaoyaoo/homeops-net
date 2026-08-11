@@ -1,5 +1,5 @@
 schema: homenet.module_artifacts.v1
-version: 0.1.0
+version: 1.0.0
 source: modules/artifacts.yaml
 artifact_count: 29
 principles:

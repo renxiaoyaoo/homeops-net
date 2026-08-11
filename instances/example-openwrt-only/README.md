@@ -9,10 +9,8 @@ This is a public example for homes without Pi, mini PC, NAS, or another always-o
 First pass:
 
 ```sh
-./homenet quickstart --instance instances/example-openwrt-only
+./homenet deploy --instance instances/example-openwrt-only --force --check-idempotent
 ./homenet check --instance instances/example-openwrt-only
-./homenet inputs --instance instances/example-openwrt-only
-./homenet secrets --instance instances/example-openwrt-only
 ```
 
 Review before live changes:

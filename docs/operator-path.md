@@ -35,10 +35,6 @@ Use this path for a new home:
 ```sh
 ./homenet profiles
 ./homenet init --name my-home --profile openwrt-pi
-./homenet inputs --instance instances/my-home
-./homenet secrets --instance instances/my-home
-./homenet preflight --instance instances/my-home
-./homenet adopt --instance instances/my-home
 ./homenet deploy --instance instances/my-home --force --check-idempotent
 ./homenet check --instance instances/my-home
 ```
@@ -167,7 +163,7 @@ If the real-home instance needs to move out of a mixed private workspace, use
 is the source of truth for that separation: copy only the instance YAML and
 README files into the private instance directory or private repository, keep
 runtime directories and source-tool state untracked, then validate the copied
-instance with `check`, `quickstart`, `workspace`, and `ci`. This separation is a
+instance with `check`, `status --live`, `workspace`, and `deploy --check-idempotent`. This separation is a
 documentation and versioning move; it must not change OpenWrt, DNS, Proxy,
 Cloudflare, Kuma, Docker, systemd, or any live network setting by itself.
 

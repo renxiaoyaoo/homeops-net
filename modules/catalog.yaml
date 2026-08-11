@@ -1,5 +1,5 @@
 schema: homenet.module_definitions.v1
-version: 0.1.0
+version: 1.0.0
 module_count: 9
 principles:
   - A module is a bounded capability with inputs, generated outputs, checks, rollback, and source-tool boundaries.

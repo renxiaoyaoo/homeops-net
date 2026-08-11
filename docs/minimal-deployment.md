@@ -15,8 +15,7 @@ The minimal shape is:
    PC, NAS, or another always-on Linux host.
 5. `templates/compose/env.example`: public names for required local values,
    without secrets.
-6. `homenet adopt`: short source-tool sequence and next checkpoint.
-7. `homenet deploy --check-idempotent`: small deployment directory with README,
+6. `homenet deploy --check-idempotent`: small deployment directory with README,
    commands, compose, env example, manifest, and repeat-generation proof.
 
 ## What It Does
@@ -41,7 +40,6 @@ The minimal shape is:
 For a home that already works, the main path is:
 
 ```sh
-./homenet adopt --instance instances/my-home
 ./homenet deploy --instance instances/my-home --force --check-idempotent
 ./homenet check --instance instances/my-home
 ```

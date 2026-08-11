@@ -6,8 +6,8 @@ existing home into HomeNet.
 
 Each source-tool change should follow the same loop:
 
-1. Read intent: `homenet adopt --instance <instance>` and
-   `homenet deploy --instance <instance> --force --check-idempotent`.
+1. Read intent: `homenet deploy --instance <instance> --force --check-idempotent`
+   and `homenet check --instance <instance>`.
 2. Back up the source tool or confirm the rollback path.
 3. Change one source tool and one layer only.
 4. Verify with `homenet verify --instance <instance> --live` or

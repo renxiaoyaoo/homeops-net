@@ -1,5 +1,5 @@
 schema: homenet.module_backups.v1
-version: 0.1.0
+version: 1.0.0
 source: modules/backups.yaml
 principles:
   - Backup contracts are module-owned dry-run declarations.

@@ -54,10 +54,9 @@ For non-interactive use:
 `deploy --check-idempotent` and `check` are the main deployment checkpoints.
 They show the source-tool sequence, write the minimal deployment files, and
 prove repeat generation is stable without changing live network state.
-`quickstart` is the first reading layer; `status --live` and `doctor --live`
-are the first troubleshooting layer after deployment. Deeper module, release
-gate, apply, backup, and proof commands are advanced references, not the normal
-usage path.
+`status --live` and `doctor --live` are the first troubleshooting layer after
+deployment. Deeper module, release gate, apply, backup, and proof commands are
+advanced references, not the normal usage path.
 
 For the exact useful/advanced/non-goal split, read `docs/function-boundary.md`.
 
@@ -100,10 +99,9 @@ what a future apply would need; live writes remain source-tool controlled until
 guarded apply is implemented and verified.
 
 ```sh
-./homenet quickstart --instance instances/my-home
-./homenet worksheet --instance instances/my-home
 ./homenet deploy --instance instances/my-home --output-dir /tmp/homenet-deploy --force --check-idempotent
 ./homenet check --instance instances/my-home
+./homenet status --instance instances/my-home --live
 ```
 
 Use OpenWrt/LuCI/UCI, Docker/systemd, Cloudflare, Kuma, Home Assistant, or other

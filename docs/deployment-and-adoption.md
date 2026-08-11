@@ -22,12 +22,7 @@ Observation checks whether the live state still matches the intent.
 Start with the smallest path that creates a working private instance:
 
 ```sh
-./homenet quickstart --profile openwrt-pi
 ./homenet init --name my-home --profile openwrt-pi
-./homenet inputs --instance instances/my-home
-./homenet secrets --instance instances/my-home
-./homenet preflight --instance instances/my-home
-./homenet adopt --instance instances/my-home
 ./homenet deploy --instance instances/my-home --force --check-idempotent
 ./homenet check --instance instances/my-home
 ```
@@ -46,8 +41,6 @@ one source tool at a time.
 
 ```sh
 ./homenet init --name my-home --profile openwrt-pi
-./homenet inputs --instance instances/my-home
-./homenet adopt --instance instances/my-home
 ./homenet deploy --instance instances/my-home --force --check-idempotent
 ./homenet check --instance instances/my-home
 ```
@@ -66,12 +59,11 @@ Adoption order:
 6. Smart home and optional modules: record Home Assistant, MQTT, Zigbee2MQTT,
    cameras, and device-specific quirks.
 
-`adopt` and `deploy --check-idempotent` are the default checkpoints for
-this order. They are intentionally shorter than `bootstrap` and
-`deploy --dry-run`: they tell the operator which source tool is next, produce the
-minimal deployment review, and prove repeated generation is stable. Use
-`bootstrap` only when you need the expanded first-install checklist; use
-`deploy --dry-run` only when you need the full review contract.
+`deploy --check-idempotent` and `check` are the default checkpoints for this
+order. They tell the operator which source tool is next, produce the minimal
+deployment review, and prove repeated generation is stable. Use `bootstrap`
+only when you need the expanded first-install checklist; use `deploy --dry-run`
+only when you need the full review contract.
 
 For each layer, apply changes in the owning source tool and verify before
 moving to the next layer:

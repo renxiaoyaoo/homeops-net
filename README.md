@@ -50,9 +50,9 @@ Room AP、Maintenance Wi-Fi、Remote Access、Smart Home，然后生成私有 in
 ./homenet status --instance instances/my-home --live
 ```
 
-`quickstart` 的默认输出先给 First Deployment、Daily Use、Incident Response
-和边界规则；module detail、dry-run apply、bundle、publish 等命令是第二层，
-等第一轮实例能通过 CI 后再看。
+`deploy --check-idempotent` 会生成最小部署包并证明重复生成不漂移；
+`check` 和 `status --live` 是部署后的主检查入口。module detail、dry-run
+apply、bundle、publish 等命令是第二层，等第一轮实例能通过主线检查后再看。
 
 没有常在线主机时：
 
@@ -126,7 +126,6 @@ CLI 的日常只读入口：
 
 ```sh
 ./homenet init --name my-home --profile openwrt-pi
-./homenet inputs --instance instances/my-home
 ./homenet deploy --instance instances/my-home --force --check-idempotent
 ./homenet check --instance instances/my-home
 ```
@@ -195,7 +194,7 @@ HomeNet core、schema、module、deploy/check 和 live status 模型；区别只
 `workspace` 还会给出 Private Instance Boundary：如果以后要把真实家庭实例从混合
 workspace 分离到私有目录或私有仓库，只复制 `site.yaml`、`devices.yaml`、
 `services.yaml`、`README.md`，运行数据和 source tool 目录不跟着搬，接管前后用
-`check`、`quickstart`、`workspace`、`deploy --check-idempotent` 验证。
+`check`、`status --live`、`workspace`、`deploy --check-idempotent` 验证。
 
 ## 开源包导出
 

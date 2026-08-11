@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import hashlib
 import io
 import ipaddress
 import json
@@ -116,6 +117,19 @@ def default_instance_path() -> Path:
             if path.is_dir() and not path.name.startswith("example-"):
                 return path
     return PUBLIC_DEFAULT_INSTANCE
+
+
+def snapshot_directory(path: Path) -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    ignored_dirs = {".git", "__pycache__", ".pytest_cache", "node_modules"}
+    ignored_files = {".DS_Store"}
+    for item in sorted(path.rglob("*")):
+        rel_parts = item.relative_to(path).parts
+        if any(part in ignored_dirs for part in rel_parts) or item.name in ignored_files:
+            continue
+        if item.is_file():
+            snapshot[str(item.relative_to(path))] = hashlib.sha256(item.read_bytes()).hexdigest()
+    return snapshot
 
 
 DEFAULT_INSTANCE = default_instance_path()
@@ -2480,7 +2494,7 @@ def build_version_report(instance: Path) -> dict[str, Any]:
         "product": {
             "name": "HomeNet",
             "core_version": HOMENET_CORE_VERSION,
-            "stage": "development",
+            "stage": "stable",
         },
         "read_only": True,
         "writes_files": False,

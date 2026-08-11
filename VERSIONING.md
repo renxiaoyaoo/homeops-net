@@ -12,7 +12,7 @@ and sibling project ownership:
 ./homenet gates --instance instances/my-home
 ```
 
-The current reusable core version is `0.1.0`. Treat this as the first usable
+The current reusable core version is `1.0.0`. Treat this as the first stable
 public HomeNet core release plus one private deployment instance, not as a
 publishable copy of the whole live workspace.
 
@@ -67,11 +67,12 @@ Run these checks from the root before committing:
 ```sh
 ./homenet privacy --scope public
 ./homenet privacy --scope all --instance instances/my-home
-./homenet package --instance instances/my-home
+./homenet deploy --instance instances/my-home --force --check-idempotent
+./homenet check --instance instances/my-home
+./homenet package --instance instances/my-home --output-dir /tmp/homenet-public --force
+./homenet package-check --dir /tmp/homenet-public
+./homenet package-smoke --dir /tmp/homenet-public
 ./homenet workspace --instance instances/my-home
-./homenet progress --instance instances/my-home
-./homenet gates --instance instances/my-home
-./homenet ci --instance instances/my-home
 ```
 
 The privacy commands must not print matched secret values. If they report a finding, fix the file or keep it untracked before committing.

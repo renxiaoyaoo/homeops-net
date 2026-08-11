@@ -1,5 +1,5 @@
 schema: homenet.module_executors.v1
-version: 0.1.0
+version: 1.0.0
 source: modules/executors.yaml
 principles:
   - Executor contracts are module-owned dry-run declarations.
