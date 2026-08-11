@@ -351,13 +351,9 @@ function HomeView({ state }: { state: State }) {
           <div>
             <span>{label(severity)}</span>
             <b>{summary.headline || "等待状态"}</b>
-            <p>{problem?.next_action || "关键链路正常。需要操作时从入口进入对应 source tool。"}</p>
+            <p>{problem?.next_action || "关键链路正常。需要操作时从下面入口进入对应工具。"}</p>
           </div>
         </div>
-      </Panel>
-
-      <Panel title="坏在哪" icon={<AlertTriangle size={18} />}>
-        {problem ? <LayerFocus layer={problem} /> : <EmptyLine text="没有当前故障域；历史波动只放在详情里。" />}
       </Panel>
 
       <Panel title="常用入口" icon={<Home size={18} />}>
@@ -367,10 +363,10 @@ function HomeView({ state }: { state: State }) {
         </div>
       </Panel>
 
-      <Panel title="下一步" icon={<Wrench size={18} />}>
+      <Panel title={problem ? "需要处理" : "基础状态"} icon={<Wrench size={18} />}>
         <div className="actionBox">
           <b>{problem ? problem.title : "不用处理"}</b>
-          <p>{problem?.next_action || "当前只需要保持现状；不要因为历史 error_events 去改网络。"}</p>
+          <p>{problem?.next_action || "当前没有故障域；不要因为过去的偶发波动改网络。"}</p>
           {problem?.entry && <code>{problem.entry}</code>}
         </div>
       </Panel>
@@ -471,15 +467,6 @@ function ServicesView({ state, query, setQuery }: { state: State; query: string;
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索服务" />
       </label>
 
-      {!!state.console?.unmanaged_port_count && (
-        <Panel title="未纳入实例的监听端口" icon={<AlertTriangle size={18} />}>
-          <p className="note">这些端口实际在 Pi 上监听，但没有被 HomeNet instance 声明。需要确认是应纳入服务清单，还是应忽略。</p>
-          <div className="chipRow">
-            {(state.console.unmanaged_ports || []).map((port) => <span key={port}>tcp/{port}</span>)}
-          </div>
-        </Panel>
-      )}
-
       {groups.map(([group, items]) => (
         <section className="serviceGroup" key={group}>
           <h2>{groupLabels[group] || group}</h2>
@@ -490,6 +477,14 @@ function ServicesView({ state, query, setQuery }: { state: State; query: string;
         </section>
       ))}
       {!visible.length && <EmptyLine text="没有匹配的服务。" />}
+      {!!state.console?.unmanaged_port_count && (
+        <Panel title="端口提醒" icon={<AlertTriangle size={18} />}>
+          <p className="note">这些端口正在监听，但没有写进服务清单；它们不是当前故障，只是后续整理项。</p>
+          <div className="chipRow">
+            {(state.console.unmanaged_ports || []).map((port) => <span key={port}>tcp/{port}</span>)}
+          </div>
+        </Panel>
+      )}
     </section>
   );
 }

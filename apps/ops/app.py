@@ -301,6 +301,19 @@ def worst(statuses: list[str]) -> str:
     return max(statuses or ["unknown"], key=severity)
 
 
+def domain_status(statuses: list[str]) -> str:
+    normalized = [status or "unknown" for status in statuses]
+    if any(status in {"bad", "down"} for status in normalized):
+        return "bad"
+    if any(status == "warn" for status in normalized):
+        return "warn"
+    if all(status in {"ok", "tracked"} for status in normalized):
+        return "ok"
+    if any(status == "ok" for status in normalized) and all(status in {"ok", "tracked", "unknown"} for status in normalized):
+        return "ok"
+    return "unknown"
+
+
 def layer(layer_id: str, title: str, status: str, detail: str, next_action: str, entry: str = "") -> dict[str, Any]:
     return {"id": layer_id, "title": title, "status": status, "detail": detail, "next_action": next_action, "entry": entry}
 
@@ -493,21 +506,21 @@ async def probe_foundation_checks(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], ports: list[dict[str, Any]], foundation_checks: dict[str, Any] | None = None) -> dict[str, Any]:
-    gateway = worst([service_status(services, "openwrt-luci"), service_status(services, "openwrt-ssh")])
+    gateway = domain_status([service_status(services, "openwrt-luci"), service_status(services, "openwrt-ssh")])
     foundation_checks = foundation_checks or {"checks": []}
     foundation_items = list(foundation_checks.get("checks") or [])
     foundation_by_id = {item.get("id"): item for item in foundation_items}
     wifi_keys = ["radio0", "radio1", "wifi-main", "wifi-relay_5g", "wifi-iot", "wifi-guest", "wifi-ops"]
-    wifi_status = worst([str((foundation_by_id.get(key) or {}).get("status") or "unknown") for key in wifi_keys])
+    wifi_status = domain_status([str((foundation_by_id.get(key) or {}).get("status") or "unknown") for key in wifi_keys])
     wifi_problem = first_problem([foundation_by_id.get(key) for key in wifi_keys if foundation_by_id.get(key)] or [])
     room_probe = str((foundation_by_id.get("room-ap") or {}).get("status") or "unknown")
-    room = worst([service_status(services, "wrt-room-luci"), service_status(services, "wrt-room-ssh"), room_probe])
-    dns_proxy = worst([service_status(services, "adguard"), service_status(services, "mihomo")])
-    runtime = worst([service_status(services, key) for key in ["homenet-ops", "adguard", "mihomo", "home-assistant", "uptime-kuma", "cloudflared", "wireguard"]])
-    remote = worst([service_status(services, key) for key in ["cloudflared", "wireguard", "caddy", "ddns-go"]])
-    rescue = worst([service_status(services, "homenet-ops"), service_status(services, "pi-ssh"), str((foundation_by_id.get("wifi-ops") or {}).get("status") or "unknown")])
+    room = domain_status([service_status(services, "wrt-room-luci"), service_status(services, "wrt-room-ssh"), room_probe])
+    dns_proxy = domain_status([service_status(services, "adguard"), service_status(services, "mihomo")])
+    runtime = domain_status([service_status(services, key) for key in ["homenet-ops", "adguard", "mihomo", "home-assistant", "uptime-kuma", "cloudflared", "wireguard"]])
+    remote = domain_status([service_status(services, key) for key in ["cloudflared", "wireguard", "caddy", "ddns-go"]])
+    rescue = domain_status([service_status(services, "homenet-ops"), service_status(services, "pi-ssh"), str((foundation_by_id.get("wifi-ops") or {}).get("status") or "unknown")])
     wan_probe = str((foundation_by_id.get("wan-link") or {}).get("status") or "unknown")
-    gateway = worst([gateway, wan_probe, str((foundation_by_id.get("router-dhcp") or {}).get("status") or "unknown")])
+    gateway = domain_status([gateway, wan_probe, str((foundation_by_id.get("router-dhcp") or {}).get("status") or "unknown")])
     room_detail = str((foundation_by_id.get("room-ap") or {}).get("detail") or "卧室覆盖由 WRT Room 承担。")
 
     layers = [
