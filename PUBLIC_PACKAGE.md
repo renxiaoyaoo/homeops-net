@@ -51,12 +51,15 @@ For non-interactive use:
 ./homenet check --instance instances/my-home
 ```
 
-`deploy --check-idempotent` and `check` are the main deployment
-checkpoints. They show the source-tool sequence, write the minimal deployment files,
-and prove repeat generation is stable without changing live network state.
+`deploy --check-idempotent` and `check` are the main deployment checkpoints.
+They show the source-tool sequence, write the minimal deployment files, and
+prove repeat generation is stable without changing live network state.
 `quickstart` is the first reading layer; `status --live` and `doctor --live`
-are the first troubleshooting layer after deployment. Deeper module, release gate, apply, backup, and proof
-commands are advanced references.
+are the first troubleshooting layer after deployment. Deeper module, release
+gate, apply, backup, and proof commands are advanced references, not the normal
+usage path.
+
+For the exact useful/advanced/non-goal split, read `docs/function-boundary.md`.
 
 For the full deployment and existing-home adoption path, read
 `docs/deployment-and-adoption.md` before changing source tools.
@@ -120,13 +123,6 @@ public package is complete and that private/runtime paths were not copied:
 ```sh
 ./homenet package-check --dir /path/to/homenet-public
 ./homenet package-smoke --dir /path/to/homenet-public
-./homenet package-onboarding --dir /path/to/homenet-public --work-dir /tmp/homenet-package-onboarding --force
-./homenet publish-check --dir /path/to/homenet-public --work-dir /tmp/homenet-publish-check --force
-./homenet release-candidate --output-dir /path/to/homenet-public --repo-dir /tmp/homenet-public-repo --force
-./homenet repo-init --dir /path/to/homenet-public --repo-dir /tmp/homenet-public-repo --force
-./homenet publish-audit --dir /path/to/homenet-public --repo-dir /tmp/homenet-public-repo --run-publish-check --force
-./homenet repo-publish --dir /path/to/homenet-public --repo-dir /tmp/homenet-public-repo --remote <public-repo-url> --confirm-push PUSH-HOMENET-PUBLIC --force
-./homenet repo-plan --dir /path/to/homenet-public
 ./homenet check --instance instances/example-openwrt-pi
 ./homenet check --instance instances/example-openwrt-only
 ```
@@ -147,39 +143,6 @@ commands inside the exported directory. It confirms that the package can operate
 away from the original private workspace, but it is heavier than
 `package-check`.
 
-`package-onboarding` generates fresh `openwrt-pi` and `openwrt-only` instances
-from the exported package and runs CI against them. It writes only to the
-requested temporary work directory and does not change live network state.
-
-`publish-check` is the single review gate for an exported package or public
-repo checkout. It aggregates package validation, package smoke, onboarding, and
-repo boundary checks so a maintainer can verify the package before publishing or
-continuing deployment work.
-
-`publish-audit` is the final readiness view. It reports public release
-boundary status, privacy counts, exported package evidence, local public repo
-evidence, remaining warnings, and the next publish actions without reading or
-printing secret values.
-
-`release-candidate` creates a repeatable local candidate before a real public
-remote exists. It writes the exported package, initializes the local public git
-repo, runs package/repo/audit evidence, and never adds a remote, pushes, or
-changes live network state.
-
-`repo-init` copies the checked package into a local public git repository and
-creates the initial commit. By default it runs a lightweight review precheck
-only (`package-check` plus `repo-plan`) so repo creation stays fast. Pass
-`--run-publish-check` when you want it to run the full onboarding gate before
-creating the repo. It does not add a remote, push, or change live network state.
-
-`repo-publish` is the guarded final push helper. Without
-`--confirm-push PUSH-HOMENET-PUBLIC`, it runs a lightweight audit and reports
-the push plan. Pass `--run-publish-check` for a full dry-run audit in plan mode.
-With confirmation, it runs the full publish check automatically, then adds or
-updates `origin` and pushes the initialized public repo. It rejects remote URLs
-with inline credentials and redacts the remote in reports.
-
-`repo-plan` shows the read-only review plan for turning this checked package
-directory into its own public repository after package checks, onboarding,
-publish check, and local repo init. It does not run `git init`, create a commit,
-add a remote, or push.
+Maintainers publishing an official public repository may additionally use
+`release-candidate`, `publish-check`, `repo-init`, `publish-audit`,
+`repo-publish`, and `repo-plan`. These are release tools, not deployment tools.

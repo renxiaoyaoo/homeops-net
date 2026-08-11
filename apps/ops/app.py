@@ -15,6 +15,9 @@ from aiohttp import web
 
 OPENWRT_HOST = os.getenv("OPENWRT_HOST", "192.168.50.1")
 OPENWRT_USER = os.getenv("OPENWRT_USER", "root")
+HOMENET_SERVER_IP = os.getenv("HOMENET_SERVER_IP", "192.168.50.5")
+ROOM_AP_IP = os.getenv("ROOM_AP_IP", "192.168.50.2")
+ROOM_AP_LOCAL_IP = os.getenv("ROOM_AP_LOCAL_IP", "192.168.1.1")
 WAN_IF = os.getenv("WAN_IF", "pppoe-wan")
 MIHOMO_URL = os.getenv("MIHOMO_URL", "http://127.0.0.1:9090").rstrip("/")
 MIHOMO_CONTROLLER_CREDENTIAL = os.getenv("MIHOMO_SECRET", "")
@@ -27,10 +30,14 @@ ADGUARD_DOMESTIC_FILE = os.getenv("ADGUARD_DOMESTIC_FILE", "/adguard-conf/upstre
 PRESENCE_URL = os.getenv("PRESENCE_URL", "http://127.0.0.1:9977/state").strip()
 WIREGUARD_STATUS_FILE = os.getenv("WIREGUARD_STATUS_FILE", "/maintenance-state/wireguard/clients.json").strip()
 INSTANCE_DIR = Path(os.getenv("HOMENET_INSTANCE_DIR", "/homenet-instance")).resolve()
-HOMENET_PLAN_TOOL = Path(os.getenv("HOMENET_PLAN_TOOL", "/homenet-tools/homenet.py")).resolve()
-REFRESH = float(os.getenv("REFRESH", "1"))
-HEALTH_INTERVAL = float(os.getenv("HEALTH_INTERVAL", "30"))
+HOMENET_PLAN_TOOL = Path(os.getenv("HOMENET_PLAN_TOOL", "/tools/homenet.py")).resolve()
+REFRESH = float(os.getenv("REFRESH", "15"))
+DHCP_INTERVAL = float(os.getenv("DHCP_INTERVAL", "60"))
+SERVICE_PROBE_INTERVAL = float(os.getenv("SERVICE_PROBE_INTERVAL", "60"))
+HEAVY_PROBE_INTERVAL = float(os.getenv("HEAVY_PROBE_INTERVAL", "120"))
+HEALTH_INTERVAL = float(os.getenv("HEALTH_INTERVAL", "90"))
 ERROR_TTL = float(os.getenv("ERROR_TTL", "900"))
+METADATA_TIMEOUT = float(os.getenv("METADATA_TIMEOUT", "12"))
 SSH_OPTS = [
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=3",
@@ -43,6 +50,7 @@ STATE = {
     "ok": False,
     "updated_at": 0,
     "errors": [],
+    "error_events": [],
     "wan": {"down_mbps": 0, "up_mbps": 0, "rx_bytes": 0, "tx_bytes": 0},
     "devices": [],
     "domains": [],
@@ -86,7 +94,7 @@ HTTP_PROBE_OVERRIDES = {
 }
 
 TCP_PROBE_HOST_OVERRIDES = {
-    "192.168.50.5": "127.0.0.1",
+    HOMENET_SERVER_IP: "127.0.0.1",
 }
 
 PROBE_KEY_ALIASES = {
@@ -106,8 +114,8 @@ PROBE_KEY_ALIASES = {
 }
 
 MAC_STUDIO_PATHS = [
-    {"name": "ethernet", "ip": os.getenv("MAC_STUDIO_ETHERNET_IP", "192.168.50.10")},
-    {"name": "wifi", "ip": os.getenv("MAC_STUDIO_WIFI_IP", "192.168.50.11")},
+    {"name": "ethernet", "ip": os.getenv("MAC_STUDIO_ETHERNET_IP", "")},
+    {"name": "wifi", "ip": os.getenv("MAC_STUDIO_WIFI_IP", "")},
 ]
 
 mac_map: Dict[str, Dict[str, str]] = {}
@@ -161,7 +169,7 @@ def load_metadata() -> Dict:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=4,
+            timeout=METADATA_TIMEOUT,
         )
     except Exception as e:
         add_error(f"homenet metadata failed: {type(e).__name__}: {e}")
@@ -800,6 +808,7 @@ async def refresh_dhcp_map():
 def add_error(msg: str):
     now = time.strftime("%H:%M:%S")
     STATE["errors"] = ([f"{now} {msg}"] + STATE.get("errors", []))[:8]
+    STATE["error_events"] = ([f"{now} {msg}"] + STATE.get("error_events", []))[:24]
 
 
 def recent_errors() -> List[str]:
@@ -1389,7 +1398,8 @@ async def refresh_home_services():
     http_targets = instance_http_targets()
     tcp_targets = instance_tcp_targets()
     udp_targets = instance_udp_targets()
-    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "HomeNetOps/1.0"}) as session:
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "HomeNetOps/1.0"}, connector=connector) as session:
         results = await asyncio.gather(
             *(http_service_probe(session, target) for target in http_targets),
             *(tcp_service_probe(target) for target in tcp_targets),
@@ -1579,8 +1589,9 @@ iwinfo wlan0-3 assoclist 2>/dev/null | grep -E '^[0-9A-Fa-f:]{17}' || true
     dns_servers = parse_dhcp_dns(dhcp_options)
     dhcp_range = f"{dhcp_start}-{int(dhcp_start) + int(dhcp_limit) - 1}" if dhcp_start.isdigit() and dhcp_limit.isdigit() else ""
 
-    allow_pi_ssh = "192.168.50.5/32" in firewall_text and "--dport 22" in firewall_text
-    allow_pi_homenet = "192.168.50.5/32" in firewall_text and "--dport 9999" in firewall_text
+    server_rule = f"{HOMENET_SERVER_IP}/32"
+    allow_pi_ssh = server_rule in firewall_text and "--dport 22" in firewall_text
+    allow_pi_homenet = server_rule in firewall_text and "--dport 9999" in firewall_text
     allow_wan = "Zone ops to wan forwarding policy" in firewall_text and "zone_wan_dest_ACCEPT" in firewall_text
     input_reject = "zone_ops_src_REJECT" in firewall_text
     proxy_bypassed = "-i br-lan -j MIHOMO_POLICY" in mangle_text and "wlan0-3" not in mangle_text and "br-ops" not in mangle_text
@@ -1589,8 +1600,8 @@ iwinfo wlan0-3 assoclist 2>/dev/null | grep -E '^[0-9A-Fa-f:]{17}' || true
         ok_check("Maintenance SSID", bool(ssid and disabled != "1" and network_name == "ops"), f"{ssid} -> {network_name or 'unknown'}"),
         ok_check("Maintenance DHCP", bool(ipaddr == "192.168.40.1" and dhcp_range), f"{ipaddr}/{netmask} · {dhcp_range or 'range unknown'}"),
         ok_check("公共 DNS", bool(dns_servers), dns_servers or "未从 DHCP option 读取到 DNS", warn=True),
-        ok_check("到 Pi SSH", allow_pi_ssh, "Maintenance 客户端可访问 192.168.50.5:22"),
-        ok_check("到 HomeNet", allow_pi_homenet, "Maintenance 客户端可访问 192.168.50.5:9999"),
+        ok_check("到 Pi SSH", allow_pi_ssh, f"Maintenance 客户端可访问 {HOMENET_SERVER_IP}:22"),
+        ok_check("到 HomeNet", allow_pi_homenet, f"Maintenance 客户端可访问 {HOMENET_SERVER_IP}:9999"),
         ok_check("到 WAN", allow_wan, "Maintenance 客户端可直接出公网"),
         ok_check("隔离入口", bool(isolated == "1" and input_reject), "禁止访问路由器管理面，只保留 DHCP"),
         ok_check("绕开透明代理", proxy_bypassed, "Maintenance network 不进入 OpenWrt MIHOMO_POLICY"),
@@ -1613,7 +1624,7 @@ iwinfo wlan0-3 assoclist 2>/dev/null | grep -E '^[0-9A-Fa-f:]{17}' || true
 
 
 async def refresh_wifi_diagnostics():
-    remote = r"""
+    remote = f"""
 echo __RADIO1__
 wifi status radio1 2>/dev/null
 echo __GUARD__
@@ -1621,7 +1632,7 @@ cat /tmp/wifi-radio1-guard.last 2>/dev/null || true
 echo __BACKHAUL_ASSOC__
 iwinfo wlan1-2 assoclist 2>/dev/null | sed -n '1,14p'
 echo __ROOM_PING__
-ping -c 1 -W 1 192.168.50.2 >/dev/null 2>&1 && echo up || echo down
+ping -c 1 -W 1 {ROOM_AP_IP} >/dev/null 2>&1 && echo up || echo down
 """
     previous = STATE.get("wifi_diagnostics", {}) if isinstance(STATE.get("wifi_diagnostics"), dict) else {}
     code, out, err = await run_cmd(ssh_cmd(remote), timeout=6)
@@ -1687,7 +1698,7 @@ ping -c 1 -W 1 192.168.50.2 >/dev/null 2>&1 && echo up || echo down
         ok_check("主路由 5G radio1", radio_up and not retry_failed and not disabled, f"up={radio_up} retry_setup_failed={retry_failed} disabled={disabled}"),
         ok_check("主 Wi-Fi SSID", has_main, f"{main_ssid} 5G AP 已在 radio1 上广播" if has_main else f"radio1 SSID: {', '.join(ssids) or 'none'}"),
         ok_check("卧室回程 SSID", has_backhaul, f"{backhaul_ssid} 已在 radio1 上广播" if has_backhaul else f"radio1 SSID: {', '.join(ssids) or 'none'}"),
-        ok_check("卧室 WRT 可达", room_up, "192.168.50.2 ping up" if room_up else "192.168.50.2 ping down"),
+        ok_check("卧室 WRT 可达", room_up, f"{ROOM_AP_IP} ping up" if room_up else f"{ROOM_AP_IP} ping down"),
         ok_check("回程关联", bool(assoc_lines), f"{len(assoc_lines)} station(s) on wlan1-2" if assoc_lines else (assoc_text or "wlan1-2 no assoc")),
         ok_check("5G 自愈守护", "ok" in guard_text.lower(), guard_text or "guard state missing", warn=True),
     ]
@@ -1740,28 +1751,28 @@ def incident_decision_flow(domains: List[Dict]) -> List[Dict]:
         {
             "id": "keep-maintenance",
             "order": 1,
-            "domain": "rescue",
-            "status": incident_status(domains, "rescue"),
+            "domain": "rescue-path",
+            "status": incident_status(domains, "rescue-path"),
             "question": "还能不能通过低依赖通道进 Pi/OpenWrt？",
             "why_first": "没有维护通道就不要扩大改动；先保证还能观察和回滚。",
             "if_bad": [
                 "用 Maintenance Wi-Fi 或直连 IP 访问 OpenWrt/Pi。",
                 "只检查 DHCP、firewall、SSID 和到 Pi/OpenWrt 的路径。",
             ],
-            "entries": ["http://192.168.50.5:9999/", "ssh pi", "ssh wrt"],
+            "entries": [f"http://{HOMENET_SERVER_IP}:9999/", "ssh pi", "ssh wrt"],
         },
         {
             "id": "prove-gateway",
             "order": 2,
-            "domain": "gateway",
-            "status": incident_status(domains, "gateway"),
+            "domain": "gateway-wan",
+            "status": incident_status(domains, "gateway-wan"),
             "question": "主路由、LAN、WAN 是不是基础正常？",
             "why_first": "Gateway/WAN 不正常时，DNS、Proxy、Cloudflare、Kuma 的异常都可能是下游假象。",
             "if_bad": [
                 "先看 OpenWrt WAN、接口状态、DHCP 和防火墙。",
                 "不要先重启 Pi 服务或改 Mihomo/AdGuard。",
             ],
-            "entries": commands("gateway") or ["http://192.168.50.1/cgi-bin/luci", "ssh wrt"],
+            "entries": commands("gateway-wan") or [f"http://{OPENWRT_HOST}/cgi-bin/luci", "ssh wrt"],
         },
         {
             "id": "prove-wifi",
@@ -1787,20 +1798,20 @@ def incident_decision_flow(domains: List[Dict]) -> List[Dict]:
                 "先看 AdGuard/router DNS，再看 Mihomo rule/provider/group。",
                 "如果只有某个客户端异常，先排客户端代理模式和系统 DNS。",
             ],
-            "entries": commands("dns-proxy") or ["http://192.168.50.5:9090/ui/#/proxies"],
+            "entries": commands("dns-proxy") or [f"http://{HOMENET_SERVER_IP}:9090/ui/#/proxies"],
         },
         {
             "id": "prove-server",
             "order": 5,
-            "domain": "pi-services",
-            "status": incident_status(domains, "pi-services"),
+            "domain": "server-runtime",
+            "status": incident_status(domains, "server-runtime"),
             "question": "是不是 Pi 上一组服务一起异常？",
             "why_first": "HomeNet/Kuma/Mihomo/AdGuard/HA 一起异常时，先当作 server runtime 事件处理。",
             "if_bad": [
                 "先查 Docker/systemd、磁盘、内存和端口监听。",
                 "LAN 本地服务没好之前，不诊断 Cloudflare 外部入口。",
             ],
-            "entries": commands("pi-services") or ["ssh pi", "docker ps", "ss -ltn"],
+            "entries": commands("server-runtime") or ["ssh pi", "docker ps", "ss -ltn"],
         },
         {
             "id": "prove-remote",
@@ -1813,20 +1824,20 @@ def incident_decision_flow(domains: List[Dict]) -> List[Dict]:
                 "LAN target 正常才看 Cloudflare Tunnel/Access/Caddy/DDNS/WireGuard。",
                 "LAN target 也坏就回到 Pi runtime 或 Gateway/WAN。",
             ],
-            "entries": ["http://192.168.50.5:9999/", "https://external Ops URL/", *commands("remote-access")[:1]],
+            "entries": [f"http://{HOMENET_SERVER_IP}:9999/", "https://external Ops URL/", *commands("remote-access")[:1]],
         },
     ]
 
 
 def incident_recovery_matrix(domains: List[Dict]) -> List[Dict]:
     rows = [
-        ("所有 Wi-Fi/有线都慢或无网", "gateway", "http://192.168.50.1/cgi-bin/luci", "WAN interface, DHCP lease, DNS handed to client", "OpenWrt Gateway / ISP modem", "Mihomo provider, Cloudflare, HA, or Kuma"),
-        ("断电后来电 5G/SSID 不出现", "main-wifi-5g", "http://192.168.50.1/cgi-bin/luci", "radio1 enabled, SSID broadcast, client association, system log", "OpenWrt wireless config", "DNS/proxy rules"),
-        ("卧室慢、切 AP 不顺、Room AP 客户端异常", "room-ap", "http://192.168.50.2/ from main LAN; http://192.168.50.1/ when connected under WRT Room", "Room AP upstream/backhaul, DHCP server disabled, client lease source", "Room AP LuCI/SSH + Gateway wireless", "global Wi-Fi redesign"),
-        ("国内 App 开代理很慢，关代理正常", "dns-proxy", "http://192.168.50.5:9090/ui/#/proxies", "rule match, DIRECT path, selected proxy group, DNS result type", "Mihomo rules + AdGuard/router DNS", "WAN reboot unless direct path also fails"),
-        ("HomeNet/Kuma/HA/Mihomo/AdGuard 一起掉", "pi-services", "ssh pi", "Docker ps, systemd units, listening ports, disk/memory", "Pi Docker/systemd", "Cloudflare Access settings"),
-        ("外部域名打不开，但 LAN 可能正常", "remote-access", "http://192.168.50.5:9999/", "Cloudflare Tunnel/Access, Caddy/DDNS, WireGuard handshake", "Cloudflare / cloudflared / Caddy / WireGuard", "service restart before local target is checked"),
-        ("单个设备 IP/名字不对，尤其 Apple 或 IoT", "client-device", "http://192.168.50.1/cgi-bin/luci", "SSID-specific MAC, static lease, hostname source, device power state", "OpenWrt DHCP/static lease + device native settings", "whole-network changes"),
+        ("所有 Wi-Fi/有线都慢或无网", "gateway-wan", f"http://{OPENWRT_HOST}/cgi-bin/luci", "WAN interface, DHCP lease, DNS handed to client", "OpenWrt Gateway / ISP modem", "Mihomo provider, Cloudflare, HA, or Kuma"),
+        ("断电后来电 5G/SSID 不出现", "main-wifi-5g", f"http://{OPENWRT_HOST}/cgi-bin/luci", "radio1 enabled, SSID broadcast, client association, system log", "OpenWrt wireless config", "DNS/proxy rules"),
+        ("卧室慢、切 AP 不顺、Room AP 客户端异常", "room-ap", f"http://{ROOM_AP_IP}/ from main LAN; http://{ROOM_AP_LOCAL_IP}/ when connected under WRT Room", "Room AP upstream/backhaul, DHCP server disabled, client lease source", "Room AP LuCI/SSH + Gateway wireless", "global Wi-Fi redesign"),
+        ("国内 App 开代理很慢，关代理正常", "dns-proxy", f"http://{HOMENET_SERVER_IP}:9090/ui/#/proxies", "rule match, DIRECT path, selected proxy group, DNS result type", "Mihomo rules + AdGuard/router DNS", "WAN reboot unless direct path also fails"),
+        ("HomeNet/Kuma/HA/Mihomo/AdGuard 一起掉", "server-runtime", "ssh pi", "Docker ps, systemd units, listening ports, disk/memory", "Pi Docker/systemd", "Cloudflare Access settings"),
+        ("外部域名打不开，但 LAN 可能正常", "remote-access", f"http://{HOMENET_SERVER_IP}:9999/", "Cloudflare Tunnel/Access, Caddy/DDNS, WireGuard handshake", "Cloudflare / cloudflared / Caddy / WireGuard", "service restart before local target is checked"),
+        ("单个设备 IP/名字不对，尤其 Apple 或 IoT", "client-device", f"http://{OPENWRT_HOST}/cgi-bin/luci", "SSID-specific MAC, static lease, hostname source, device power state", "OpenWrt DHCP/static lease + device native settings", "whole-network changes"),
     ]
     return [
         {
@@ -1879,7 +1890,7 @@ def update_incident_summary():
 
     domains = [
         incident_domain(
-            "gateway",
+            "gateway-wan",
             "主路由 / WAN",
             gateway_status,
             "所有 LAN、Wi-Fi、透明代理入口都先经过 OpenWrt Gateway。",
@@ -1902,8 +1913,8 @@ def update_incident_summary():
             room_status,
             "卧室 WRT 通过 Room backhaul 回连主路由，再给卧室设备提供覆盖。",
             f"ping .2={'up' if wifi.get('room_reachable') else 'down'} backhaul_assoc={wifi.get('backhaul_assoc_count', 0)} LuCI={service_status('wrt-room-luci')}",
-            "如果主 5G 正常但 .2 不通，再查 WRT Room 的电源、位置和无线回程；手机连在 WRT Room 下时用 192.168.50.1 看房间侧后台。",
-            ["ping 192.168.50.2", "ssh wrt-room", "open http://192.168.50.1/ from a WRT Room client", "iwinfo wlan1-2 assoclist"],
+            f"如果主 5G 正常但 {ROOM_AP_IP} 不通，再查 WRT Room 的电源、位置和无线回程；手机连在 WRT Room 下时用 {ROOM_AP_LOCAL_IP} 看房间侧后台。",
+            [f"ping {ROOM_AP_IP}", "ssh wrt-room", f"open http://{ROOM_AP_LOCAL_IP}/ from a WRT Room client", "iwinfo wlan1-2 assoclist"],
         ),
         incident_domain(
             "dns-proxy",
@@ -1915,7 +1926,7 @@ def update_incident_summary():
             ["curl http://127.0.0.1:9090/version", "nslookup github.com 127.0.0.1", "nslookup aweme.snssdk.com 127.0.0.1"],
         ),
         incident_domain(
-            "pi-services",
+            "server-runtime",
             "Pi 服务",
             pi_status,
             "HomeNet、HA、Kuma、AdGuard、Mihomo、WireGuard、cloudflared 都在 Pi 上，Pi 异常会让很多入口一起掉。",
@@ -1933,13 +1944,13 @@ def update_incident_summary():
             ["docker logs cloudflared --tail 80", "docker logs wg-easy --tail 80"],
         ),
         incident_domain(
-            "rescue",
+            "rescue-path",
             "检修通道",
             rescue_status,
             "Maintenance Wi-Fi 应该绕开透明代理和家庭 DNS，保留直出公网、Pi SSH、HomeNet 访问。",
             f"Maintenance Wi-Fi={'ok' if ops.get('ok') else 'check'} clients={len(ops.get('clients') or [])}",
             "主网络出问题时，用设备连 Maintenance Wi-Fi，再在设备上单独开代理访问 Codex，同时让 Codex SSH 到 Pi。",
-            ["ssh pi", "open http://192.168.50.5:9999/"],
+            ["ssh pi", f"open http://{HOMENET_SERVER_IP}:9999/"],
         ),
         incident_domain(
             "client-device",
@@ -1978,7 +1989,7 @@ def update_incident_summary():
         "runbook": [
             "先看主路由和 WAN 是否可达；如果路由器不通，其他状态都不可信。",
             "来电后重点看 radio1：Main Wi-Fi 5G 和 Room backhaul 都依赖它。",
-            "radio1 正常后再看 192.168.50.2 和回程关联，判断卧室覆盖是否恢复。",
+            f"radio1 正常后再看 {ROOM_AP_IP} 和回程关联，判断卧室覆盖是否恢复。",
             "家里能连 Wi-Fi 但网页慢或打不开时，再看 AdGuard/Mihomo/DNS 健康检查。",
             "多个入口同时坏时，优先查 Pi 的 Docker、systemd 和网络。",
             "需要远程检修时，连 Maintenance Wi-Fi，设备自己开代理，保持到 Pi 的 SSH/HomeNet 通路。",
@@ -2073,9 +2084,12 @@ def update_insights_and_history():
 async def sampler_loop():
     await refresh_dhcp_map()
     last_map = 0.0
+    last_service_probe = 0.0
+    last_heavy_probe = 0.0
     while True:
         start = time.time()
-        if start - last_map > 30:
+        STATE["errors"] = []
+        if start - last_map > DHCP_INTERVAL:
             await refresh_dhcp_map()
             last_map = start
         await read_wan_counters()
@@ -2085,26 +2099,30 @@ async def sampler_loop():
             await read_mihomo()
         except Exception as e:
             add_error(f"mihomo sampler failed: {e}")
-        try:
-            await refresh_home_services()
-        except Exception as e:
-            add_error(f"home service probe failed: {e}")
-        try:
-            await refresh_presence()
-        except Exception as e:
-            add_error(f"presence probe failed: {e}")
-        try:
-            refresh_remote_access()
-        except Exception as e:
-            add_error(f"remote access probe failed: {e}")
-        try:
-            await refresh_ops_network()
-        except Exception as e:
-            add_error(f"ops network probe failed: {e}")
-        try:
-            await refresh_wifi_diagnostics()
-        except Exception as e:
-            add_error(f"wifi diagnostics failed: {e}")
+        if start - last_service_probe > SERVICE_PROBE_INTERVAL:
+            try:
+                await refresh_home_services()
+            except Exception as e:
+                add_error(f"home service probe failed: {e}")
+            try:
+                await refresh_presence()
+            except Exception as e:
+                add_error(f"presence probe failed: {e}")
+            try:
+                refresh_remote_access()
+            except Exception as e:
+                add_error(f"remote access probe failed: {e}")
+            last_service_probe = start
+        if start - last_heavy_probe > HEAVY_PROBE_INTERVAL:
+            try:
+                await refresh_ops_network()
+            except Exception as e:
+                add_error(f"ops network probe failed: {e}")
+            try:
+                await refresh_wifi_diagnostics()
+            except Exception as e:
+                add_error(f"wifi diagnostics failed: {e}")
+            last_heavy_probe = start
         update_incident_summary()
         update_insights_and_history()
         STATE["ok"] = True
@@ -2288,7 +2306,7 @@ async def events(request):
         while True:
             await resp.write(f"data: {json.dumps(STATE, ensure_ascii=False)}\n\n".encode())
             await asyncio.sleep(REFRESH)
-    except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
+    except (asyncio.CancelledError, ConnectionError, ConnectionResetError, BrokenPipeError, TimeoutError, RuntimeError):
         pass
     return resp
 

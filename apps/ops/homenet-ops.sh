@@ -9,7 +9,7 @@ else
 fi
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 SERVICE="homenet-ops"
-URL="http://192.168.50.5:9999"
+URL="${HOMENET_OPS_URL:-http://127.0.0.1:9999}"
 
 compose() {
   docker-compose -f "$COMPOSE_FILE" "$@"

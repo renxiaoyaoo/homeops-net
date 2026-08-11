@@ -780,7 +780,7 @@ It provides:
 - Command hints and expected evidence.
 - Criticality counts and profile-aware fallback behavior.
 - Live gates that group checks into pre-apply decisions and post-apply regression checks.
-- Adoption status for moving legacy shell checks into structured `homenet check --live`.
+- Current evidence source and next step for structured `homenet check --live`.
 
 The command does not run probes, read command output, query live infrastructure, or include secrets. OpenWrt-only profiles do not show server-only Docker/systemd checks; they expose router-side lightweight status, OpenWrt init/filesystem, OpenWrt-local proxy, WireGuard, generated config, policy, DNS, connectivity, Remote ingress, Cloudflare provider, and DHCP evidence instead. `homenet check --live` consumes this contract for both OpenWrt + server and OpenWrt-only deployments as read-only evidence. Future apply workflows must use the pre-apply gates before source-tool changes and the post-apply regression gate after each change.
 
@@ -1040,7 +1040,7 @@ The command must skip generated state, env files, databases, service-owned runti
 
 It provides:
 
-- Monitor candidates grouped by Remote Entry, Network Core, Home Core, HomeNet Core, and Other.
+- Monitor candidates grouped by Remote Access, Network Core, Home Core, HomeNet Core, and Other.
 - Monitor type and target.
 - Scope, source, recommended interval, and alert intent.
 - Whether a candidate is safe for automatic import or should stay manual.

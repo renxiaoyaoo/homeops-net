@@ -5,25 +5,16 @@ import {
   AlertTriangle,
   ArrowUpRight,
   CheckCircle2,
-  Cloud,
   Compass,
-  Cpu,
-  Gauge,
   Globe2,
   Home,
   Layers3,
-  LockKeyhole,
-  Monitor,
   RadioTower,
   RefreshCw,
-  Router,
   Save,
   Search,
-  Server,
-  ShieldCheck,
   Sparkles,
   Trash2,
-  Users,
   Wifi,
   Wrench,
   XCircle
@@ -49,6 +40,17 @@ type Device = Rate & {
   mac?: string;
   name?: string;
   host?: string;
+};
+
+type DeviceInventoryItem = {
+  id?: string;
+  name?: string;
+  role?: string;
+  ip?: string;
+  network?: string;
+  status?: Status;
+  label?: string;
+  detail?: string;
 };
 
 type RouteSummary = Rate & {
@@ -211,12 +213,24 @@ type Incident = {
   updated_at?: number;
 };
 
+type InstanceDevice = {
+  id?: string;
+  name?: string;
+  role?: string;
+  network?: string;
+  ip?: string;
+  hostnames?: string[];
+  expected?: boolean;
+  presence?: string;
+  notes?: string;
+};
+
 type InstanceState = {
   ok?: boolean;
   site?: { name?: string; display_name?: string; domain?: string; locale?: string };
   networks?: Record<string, { cidr?: string; gateway?: string; purpose?: string; dns_mode?: string; proxy_mode?: string }>;
   wifi?: Record<string, { ssid?: string; network?: string; band?: string; purpose?: string; broadcast_by?: string[] }>;
-  devices?: Array<{ id?: string; name?: string; role?: string; network?: string; ip?: string; hostnames?: string[]; expected?: boolean }>;
+  devices?: InstanceDevice[];
   services?: Array<{ id?: string; name?: string; category?: string; role?: string; host?: string; runtime?: string; owner?: string }>;
   updated_at?: number;
 };
@@ -371,28 +385,6 @@ function relativeTime(ts?: number) {
   return `${Math.round(minutes / 60)}h ago`;
 }
 
-function personLabel(id?: string) {
-  const labels: Record<string, string> = {
-    budongdiding: "不动地丁",
-    fei: "邻居发言"
-  };
-  return labels[id || ""] || id || "unknown";
-}
-
-function ageLabel(seconds?: number | null) {
-  if (seconds === null || seconds === undefined) return "waiting";
-  if (seconds < 60) return `${seconds}s`;
-  return `${Math.round(seconds / 60)}m`;
-}
-
-function remoteStatusLabel(client: RemoteClient) {
-  const scope = client.endpoint_scope === "outside" ? "外网" : client.endpoint_scope === "lan" ? "局域网" : "未知来源";
-  if (client.status === "active") return `${scope} · 正在连接`;
-  if (client.status === "recent") return `${scope} · 最近连接`;
-  if (client.status === "stale") return `${scope} · 很久前`;
-  return client.has_endpoint ? `${scope} · 无近期握手` : "未连接";
-}
-
 function statusClass(status?: Status) {
   if (status === "ok") return "ok";
   if (status === "warn") return "warn";
@@ -415,7 +407,7 @@ function serviceLinks(service: HomeService | Ingress) {
   if ("local_href" in service && service.local_href && service.local_href !== service.href) {
     links.push({ label: "局域网", href: service.local_href });
   }
-  if (service.key === "wrt-room-luci") links.push({ label: "房间侧", href: "http://192.168.50.1/" });
+  if (service.key === "wrt-room-luci") links.push({ label: "房间侧", href: "http://192.168.1.1/" });
   return links;
 }
 
@@ -427,25 +419,101 @@ function serviceDescription(service: HomeService | Ingress) {
 
 function serviceGroups(services: HomeService[]) {
   return services.reduce<Record<string, HomeService[]>>((groups, service) => {
-    const key = service.kind || "other";
+    const key = displayServiceGroup(service);
     groups[key] = groups[key] || [];
     groups[key].push(service);
     return groups;
   }, {});
 }
 
+function displayServiceGroup(service?: HomeService | string) {
+  const kind = typeof service === "string" ? service : service?.kind;
+  const key = typeof service === "string" ? "" : service?.key;
+  if (["openwrt-luci", "openwrt-ssh", "wrt-room-luci", "wrt-room-ssh", "pi-ssh", "homenet-ops"].includes(key || "")) return "maintenance-entry";
+  if (kind === "storage") return "control-core";
+  if (kind === "udp-entry") return "remote-entry";
+  return kind || "other";
+}
+
+function serviceGroupEntries(services: HomeService[]) {
+  const order = ["network-core", "maintenance-entry", "remote-entry", "home-core", "control-core", "system-task", "other"];
+  const groups = serviceGroups(services);
+  return Object.entries(groups).sort(([a], [b]) => {
+    const ai = order.indexOf(a);
+    const bi = order.indexOf(b);
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi) || a.localeCompare(b);
+  });
+}
+
 function groupLabel(kind: string) {
   const labels: Record<string, string> = {
-    "control-core": "HomeNet",
-    "network-core": "Network",
-    "home-core": "Home",
-    "remote-entry": "Access",
-    "system-task": "System",
-    "udp-entry": "UDP",
-    storage: "Files",
-    other: "Other"
+    "network-core": "网络核心",
+    "maintenance-entry": "维护入口",
+    "remote-entry": "远程入口",
+    "home-core": "智能家居",
+    "control-core": "日常应用",
+    "system-task": "后台任务",
+    other: "其他"
   };
   return labels[kind] || kind;
+}
+
+function groupDescription(kind: string) {
+  const descriptions: Record<string, string> = {
+    "network-core": "路由、DNS、Proxy、卧室 AP 这类网络基础能力；这里异常会影响大部分设备。",
+    "maintenance-entry": "日常排查首先打开的入口，例如 OpenWrt、卧室 WRT、Pi SSH 和 HomeNet Ops。",
+    "remote-entry": "从外面回家或公网访问的入口；本地目标正常后再查 Cloudflare、Caddy 或 WireGuard。",
+    "home-core": "Home Assistant、摄像头、MQTT、Zigbee 和家庭自动化相关服务。",
+    "control-core": "日常会打开的管理入口、自建应用和文件入口。",
+    "system-task": "后台同步、更新、presence 上报等任务，通常没有 Web UI。",
+    other: "暂未归类的服务。"
+  };
+  return descriptions[kind] || "按 instance 中声明的服务类别分组。";
+}
+
+function portScopeLabel(scope?: string) {
+  const value = (scope || "").toLowerCase();
+  if (!value) return "未标注";
+  if (value === "local" || value === "localhost") return "仅本机";
+  if (value.includes("wan") && value.includes("lan")) return "局域网/远程";
+  if (value.includes("wan")) return "远程入口";
+  if (value.includes("router")) return "路由器转发";
+  if (value.includes("lan")) return "局域网";
+  return scope || "未标注";
+}
+
+function portSummary(ports: PortEntry[]) {
+  if (!ports.length) return "无监听端口";
+  const scopes = Array.from(new Set(ports.map((port) => portScopeLabel(port.scope))));
+  return scopes.join(" / ");
+}
+
+function deviceInventory(state: State): DeviceInventoryItem[] {
+  const activeByIp = new Map((state.devices || []).filter((device) => device.ip).map((device) => [device.ip, device]));
+  return (state.instance?.devices || []).map((device) => {
+    const active = device.ip ? activeByIp.get(device.ip) : undefined;
+    if (active) {
+      const speed = `${number(active.down_mbps)} / ${number(active.up_mbps)} Mbps`;
+      return { ...device, status: "ok", label: "在线", detail: speed };
+    }
+    if (device.expected === false) {
+      return { ...device, status: "tracked", label: "预期离线", detail: device.notes || "保留记录；不要求日常在线" };
+    }
+    if (device.presence === "optional") {
+      return { ...device, status: "tracked", label: "可离线", detail: device.notes || "可休眠、备用链路或非当前连接" };
+    }
+    if (device.presence === "intermittent") {
+      return { ...device, status: "tracked", label: "间歇在线", detail: device.notes || "IoT/摄像头可能按需唤醒或短时离线" };
+    }
+    const role = `${device.role || ""}`.toLowerCase();
+    if (role.includes("laptop") || role.includes("desktop")) {
+      return { ...device, status: "tracked", label: "可能休眠", detail: device.notes || "电脑休眠或关机不一定是网络故障" };
+    }
+    if (role.includes("phone")) {
+      return { ...device, status: "tracked", label: "可能外出", detail: device.notes || "手机离家或切到蜂窝网络不算故障" };
+    }
+    return { ...device, status: "warn", label: "未看到", detail: device.notes || "未在当前流量/DHCP 证据中出现" };
+  });
 }
 
 function statusSummary(items: Array<{ status?: Status }>) {
@@ -489,6 +557,7 @@ function useOpsModel(state: State, query: string) {
     const remoteClients = (remoteAccess.clients || []).filter((client) => client.enabled !== false && client.status !== "idle");
     const activeRemoteClients = remoteClients.filter((client) => client.endpoint_scope === "outside" && (client.status === "active" || client.status === "recent"));
     const activeDevices = (state.devices || []).filter((device) => (device.up_mbps || 0) + (device.down_mbps || 0) > 0.01);
+    const inventory = deviceInventory(state);
     const serviceHosts = Array.from(new Map(
       services
         .flatMap((service) => (service.ports || []).map((port) => ({
@@ -528,9 +597,11 @@ function useOpsModel(state: State, query: string) {
       issues,
       allGood,
       activeDevices,
+      deviceInventory: inventory,
       serviceHosts,
       topRoute: (state.route_summary || [])[0],
       serviceStats,
+      ports: state.ports || [],
       presence,
       remoteAccess,
       opsNetwork,
@@ -556,6 +627,7 @@ function App() {
   useEffect(() => {
     let closed = false;
     let events: EventSource | null = null;
+    let reconnectAfter = 0;
 
     const refreshHealth = async () => {
       try {
@@ -588,25 +660,35 @@ function App() {
       }
     };
 
+    const connectEvents = () => {
+      if (closed || events || Date.now() < reconnectAfter) return;
+      try {
+        events = new EventSource("/events");
+        events.onmessage = (event) => {
+          setState({ ...emptyState, ...JSON.parse(event.data) });
+          setConnected(true);
+        };
+        events.onerror = () => {
+          setConnected(false);
+          events?.close();
+          events = null;
+          reconnectAfter = Date.now() + 10000;
+        };
+      } catch {
+        setConnected(false);
+        reconnectAfter = Date.now() + 10000;
+      }
+    };
+
     loadOnce();
     refreshHealth();
-    try {
-      events = new EventSource("/events");
-      events.onmessage = (event) => {
-        setState({ ...emptyState, ...JSON.parse(event.data) });
-        setConnected(true);
-      };
-      events.onerror = () => {
-        setConnected(false);
-        events?.close();
-        events = null;
-      };
-    } catch {
-      setConnected(false);
-    }
+    connectEvents();
 
     const timer = window.setInterval(() => {
-      if (!events) loadOnce();
+      if (!events) {
+        loadOnce();
+        connectEvents();
+      }
     }, 3500);
 
     return () => {
@@ -671,11 +753,15 @@ function App() {
 }
 
 function OverviewView({ state, ops }: { state: State; ops: OpsModel }) {
-  const primaryServices = ["homenet-ops", "openwrt-luci", "wrt-room-luci", "mihomo", "adguard", "uptime-kuma", "home-assistant"]
+  const primaryServices = ["homenet-ops", "openwrt-luci", "wrt-room-luci", "mihomo", "adguard"]
     .map((key) => ops.services.find((service) => service.key === key))
     .filter(Boolean) as HomeService[];
   const issueCount = ops.issues.length + (state.errors || []).length;
   const overall = ops.allGood ? "正常" : issueCount ? "需要处理" : "需要确认";
+  const nextStep = (state.incident?.decision_flow || []).find((step) => ["bad", "warn"].includes(statusClass(step.status)));
+  const activeDomains = (state.incident?.domains || []).filter((domain) => ["bad", "warn"].includes(statusClass(domain.status)));
+  const domain = (id: string) => state.incident?.domains?.find((item) => item.id === id);
+  const nextEntries = nextStep?.entries || [];
 
   return (
     <section className="simpleBoard">
@@ -689,19 +775,40 @@ function OverviewView({ state, ops }: { state: State; ops: OpsModel }) {
           </div>
         </div>
         <div className="plainChecks">
-          <PlainCheck label="主路由/WAN" status={state.incident?.domains?.find((item) => item.id === "gateway")?.status || (state.ok ? "ok" : "warn")} detail={`${number(state.wan?.down_mbps)} Mbps down`} />
-          <PlainCheck label="Wi-Fi/卧室" status={state.incident?.domains?.find((item) => item.id === "room-ap")?.status || (state.wifi_diagnostics?.ok ? "ok" : "warn")} detail={state.wifi_diagnostics?.room_reachable ? "卧室 WRT 可达" : "等待卧室 WRT"} />
-          <PlainCheck label="DNS/代理" status={state.incident?.domains?.find((item) => item.id === "dns-proxy")?.status || "unknown"} detail={ops.topRoute?.chain || "当前无明显代理流量"} />
-          <PlainCheck label="Pi 服务" status={state.incident?.domains?.find((item) => item.id === "pi-services")?.status || (ops.badServices.length ? "warn" : "ok")} detail={`${ops.serviceStats.ok}/${ops.serviceStats.total || 0} 正常`} />
-          <PlainCheck label="外部回家" status={state.incident?.domains?.find((item) => item.id === "remote-access")?.status || (ops.remoteAccess.ok ? "ok" : "warn")} detail={`${ops.activeRemoteClients.length} 台外部设备`} />
-          <PlainCheck label="检修通道" status={state.incident?.domains?.find((item) => item.id === "rescue")?.status || (ops.opsNetwork.ok ? "ok" : "warn")} detail={ops.opsNetwork.ssid || "Maintenance Wi-Fi"} />
+          <PlainCheck label="主路由/WAN" status={domain("gateway-wan")?.status || (state.ok ? "ok" : "warn")} detail={`${number(state.wan?.down_mbps)} Mbps down`} />
+          <PlainCheck label="Wi-Fi/卧室" status={domain("room-ap")?.status || (state.wifi_diagnostics?.ok ? "ok" : "warn")} detail={state.wifi_diagnostics?.room_reachable ? "卧室 WRT 可达" : "等待卧室 WRT"} />
+          <PlainCheck label="DNS/代理" status={domain("dns-proxy")?.status || "unknown"} detail={ops.topRoute?.chain || "当前无明显代理流量"} />
+          <PlainCheck label="Pi 服务" status={domain("server-runtime")?.status || (ops.badServices.length ? "warn" : "ok")} detail={`${ops.serviceStats.ok}/${ops.serviceStats.total || 0} 正常`} />
+          <PlainCheck label="外部回家" status={domain("remote-access")?.status || (ops.remoteAccess.ok ? "ok" : "warn")} detail={`${ops.activeRemoteClients.length} 台外部设备`} />
+          <PlainCheck label="检修通道" status={domain("rescue-path")?.status || (ops.opsNetwork.ok ? "ok" : "warn")} detail={ops.opsNetwork.ssid || "Maintenance Wi-Fi"} />
         </div>
       </Panel>
 
-      <Panel title="要处理的事" icon={<AlertTriangle size={18} />}>
-        <div className="simpleList">
-          {ops.issues.slice(0, 4).map((item, index) => <SimpleIssue item={item} key={`${item.title}-${index}`} />)}
-          {!ops.issues.length && <EmptyLine text="当前没有明显异常。" />}
+      <Panel title="排障" icon={<Wrench size={18} />}>
+        <div className="nextStep">
+          {nextStep ? (
+            <article className={statusClass(nextStep.status)}>
+              {statusIcon(nextStep.status)}
+              <span>
+                <b>{nextStep.question}</b>
+                <p>{(nextStep.if_bad || [])[0] || nextStep.why_first || "先定位故障域。"}</p>
+                {!!nextEntries.length && <code>{nextEntries.slice(0, 2).join(" · ")}</code>}
+              </span>
+            </article>
+          ) : (
+            <article className="ok">
+              <CheckCircle2 size={18} />
+              <span>
+                <b>不用处理</b>
+                <p>关键链路正常；需要操作时从常用入口进入 source tool。</p>
+              </span>
+            </article>
+          )}
+        </div>
+        <div className="simpleList condensed">
+          {activeDomains.slice(0, 2).map((item) => <SimpleDomain domain={item} key={item.id || item.title} />)}
+          {ops.issues.slice(0, 2).map((item, index) => <SimpleIssue item={item} key={`${item.title}-${index}`} />)}
+          {!activeDomains.length && !ops.issues.length && <EmptyLine text="没有明显异常。" />}
         </div>
       </Panel>
 
@@ -711,30 +818,6 @@ function OverviewView({ state, ops }: { state: State; ops: OpsModel }) {
         </div>
       </Panel>
     </section>
-  );
-}
-
-function IncidentPanel({ state }: { state: State }) {
-  const incident = state.incident || {};
-  const domains = incident.domains || [];
-  const steps = incident.decision_flow || [];
-  const firstBad = domains.find((domain) => statusClass(domain.status) === "bad") || domains.find((domain) => statusClass(domain.status) === "warn") || domains[0];
-  const activeStep = steps.find((step) => ["bad", "warn"].includes(statusClass(step.status))) || steps[0];
-
-  return (
-    <Panel title="排障顺序" icon={<Wrench size={18} />}>
-      <div className={`verdict ${statusClass(incident.severity) === "ok" ? "ok" : "warn"}`}>
-        {statusClass(incident.severity) === "ok" ? <CheckCircle2 size={24} /> : <AlertTriangle size={24} />}
-        <span>
-          <b>{incident.headline || "等待诊断"}</b>
-          <p>{firstBad?.next_action || activeStep?.question || incident.summary || "正在采样关键链路。"}</p>
-        </span>
-      </div>
-      <div className="simpleList">
-        {domains.slice(0, 8).map((domain) => <SimpleDomain domain={domain} key={domain.id || domain.title} />)}
-        {!domains.length && <EmptyLine text="等待 HomeNet 采样。"/>}
-      </div>
-    </Panel>
   );
 }
 
@@ -773,39 +856,6 @@ function SimpleDomain({ domain }: { domain: IncidentDomain }) {
   );
 }
 
-function BlueprintPanel({ state }: { state: State }) {
-  const blueprint = state.blueprint || {};
-  const capabilities = blueprint.active_capabilities || [];
-  const required = capabilities.filter((item) => item.required).length;
-  const fallback = capabilities.filter((item) => item.status === "fallback").length;
-  const questions = blueprint.operational_questions || [];
-  const owners = blueprint.source_of_truth || [];
-
-  return (
-    <Panel title="Blueprint" icon={<Compass size={18} />} description={blueprint.position || "HomeNet product and instance contract."}>
-      <div className="briefGrid compact">
-        <Metric label="Profile" value={blueprint.profile || state.plan?.profile || "profile"} icon={<Layers3 size={18} />} />
-        <Metric label="Capabilities" value={`${capabilities.length}`} tone={fallback ? "warn" : "ok"} icon={<Sparkles size={18} />} />
-        <Metric label="Required" value={`${required}`} icon={<ShieldCheck size={18} />} />
-        <Metric label="Fallback" value={`${fallback}`} tone={fallback ? "warn" : "ok"} icon={<Wrench size={18} />} />
-      </div>
-      <div className="blueprintQuestions">
-        {questions.slice(0, 5).map((item) => (
-          <article key={item.question}>
-            <b>{item.question}</b>
-            <span>{item.surface}</span>
-          </article>
-        ))}
-      </div>
-      <div className="ownershipStrip">
-        {owners.slice(0, 6).map((item) => (
-          <span key={`${item.area}-${item.owner}`}>{item.area}: {item.owner}</span>
-        ))}
-      </div>
-    </Panel>
-  );
-}
-
 function ServicesView({ ops, query, onQueryChange }: { ops: OpsModel; query: string; onQueryChange: (value: string) => void }) {
   return (
     <section className="servicesView">
@@ -829,9 +879,12 @@ function ServicesView({ ops, query, onQueryChange }: { ops: OpsModel; query: str
           ))}
         </section>
       )}
-      {Object.entries(serviceGroups(ops.visibleServices)).map(([kind, items]) => (
+      {serviceGroupEntries(ops.visibleServices).map(([kind, items]) => (
         <section className="serviceGroup" key={kind}>
-          <h3>{groupLabel(kind)}</h3>
+          <div className="serviceGroupHeader">
+            <h3>{groupLabel(kind)}</h3>
+            <p>{groupDescription(kind)}</p>
+          </div>
           <div className="serviceGrid">
             {items.map((service) => <ServiceCard key={service.key || service.name} service={service} />)}
           </div>
@@ -1033,484 +1086,43 @@ function RoutingPermanentList({ entries, onDelete }: { entries: RoutingPermanent
   );
 }
 
-function NetworkView({ state, ops }: { state: State; ops: OpsModel }) {
-  return (
-    <section className="networkGrid">
-      {ops.hasDevices && (
-        <Panel title="Devices" icon={<Monitor size={18} />} description="当前有明显流量的 LAN clients；名称来自 OpenWrt DHCP leases 和 neighbor table。">
-          <DataTable
-            rows={(state.devices || []).slice(0, 14).map((device) => [
-              device.name || device.host || "unknown",
-              device.ip || "",
-              `${number(device.down_mbps)} / ${number(device.up_mbps)} Mbps`
-            ])}
-            empty=""
-          />
-        </Panel>
-      )}
-      {ops.hasRoutes && (
-        <Panel title="Proxy Routes" icon={<Globe2 size={18} />} description="Mihomo active outbound chains，例如 DIRECT、PROXY、PROXY-JAPAN 或具体 proxy group。">
-          <DataTable
-            rows={(state.route_summary || []).slice(0, 14).map((route) => [
-              route.chain || "unknown",
-              `${route.connections || 0} conn`,
-              `${number(route.down_mbps)} / ${number(route.up_mbps)} Mbps`
-            ])}
-            empty=""
-          />
-        </Panel>
-      )}
-      {ops.hasDomains && (
-        <Panel title="Top Domains" icon={<Cloud size={18} />} description="按 Mihomo active connections 聚合的目标域名，并显示命中的 rule / outbound chain。">
-          <DataTable
-            rows={(state.domains || []).slice(0, 14).map((domain) => [
-              domain.host || domain.domain || "unknown",
-              domain.chain || domain.rule || "",
-              `${number(domain.down_mbps)} / ${number(domain.up_mbps)} Mbps`
-            ])}
-            empty=""
-          />
-        </Panel>
-      )}
-      {ops.hasDnsHotspots && (
-        <Panel title="DNS Hotspots" icon={<RadioTower size={18} />} description="最近 5 分钟 DNS query 热点，用来定位高频请求的 device 或 domain。">
-          <DataTable
-            rows={(state.dns_top_devices || []).slice(0, 10).map((device) => [
-              device.device || "unknown",
-              `${device.count || 0} queries`,
-              ""
-            ])}
-            empty=""
-          />
-        </Panel>
-      )}
-      {!ops.hasDevices && !ops.hasRoutes && !ops.hasDomains && !ops.hasDnsHotspots && <EmptyBlock title="Network idle" text="当前没有可展示的流量、代理或 DNS 热点。" />}
-    </section>
-  );
-}
-
-function HealthView({ state }: { state: State }) {
-  return (
-    <section className="healthGrid">
-      <Panel title="Health Checks" icon={<ShieldCheck size={18} />} description="打开 HomeNet 时自动刷新；read-only checks 验证 DNS split、fake-ip 和 domestic DIRECT path。">
-        <div className="healthList">
-          {(state.health?.checks || []).map((check, index) => (
-            <article className={statusClass(check.status)} key={`${check.title}-${index}`}>
-              {statusIcon(check.status)}
-              <span>
-                <b>{check.title || "Check"}</b>
-                <p>{check.detail || "No detail"}</p>
-              </span>
-            </article>
-          ))}
-          {!(state.health?.checks || []).length && <EmptyLine text="正在刷新健康检查。" />}
-        </div>
-      </Panel>
-      <Panel title="Runtime" icon={<Cpu size={18} />} description="采样循环、Health Checks 和最近错误，用来判断 HomeNet runtime 是否正常。">
-        <div className="runtimeGrid">
-          <Metric label="State updated" value={relativeTime(state.updated_at)} icon={<RefreshCw size={18} />} />
-          <Metric label="Health updated" value={relativeTime(state.health?.updated_at)} icon={<ShieldCheck size={18} />} />
-          <Metric label="Presence updated" value={relativeTime(state.presence?.updated_at)} tone={state.presence?.ok ? "ok" : "warn"} icon={<Users size={18} />} />
-          <Metric label="Errors" value={`${(state.errors || []).length}`} tone={(state.errors || []).length ? "warn" : "ok"} icon={<AlertTriangle size={18} />} />
-        </div>
-        <div className="errorList">
-          {(state.errors || []).slice(0, 8).map((error, index) => <code key={index}>{error}</code>)}
-        </div>
-      </Panel>
-    </section>
-  );
-}
-
-function DetailsView({ state, ops }: { state: State; ops: OpsModel }) {
-  return (
-    <section className="detailsView">
-      <IncidentPanel state={state} />
-      <NetworkView state={state} ops={ops} />
-      <AccessView ops={ops} />
-      <HealthView state={state} />
-    </section>
-  );
-}
-
-function AccessView({ ops }: { ops: OpsModel }) {
-  const entry = (key: string) => ops.ingress.find((item) => item.key === key);
-  const presenceAps = Object.entries(ops.presence.aps || {});
-
-  return (
-    <section className="accessView">
-      <div className="sectionHeader">
-        <div>
-          <h2>Access</h2>
-          <p>Remote Ingress、WireGuard return path、Maintenance Wi-Fi 和 presence state 统一展示。</p>
-        </div>
-      </div>
-      <div className="accessGrid">
-        <Panel title="Remote Ingress" icon={<Cloud size={18} />} description="外部访问入口，包括 Cloudflare Access、Cloudflare Tunnel、IPv6 direct 和 WireGuard UDP。">
-          <div className="entryList">
-            {[entry("homenet-access"), entry("ha-tunnel"), entry("ipv6-kuma"), entry("wireguard"), entry("cf-access-launcher")].filter(Boolean).map((item) => (
-              <ServiceRow key={item!.key || item!.name} service={item!} compact />
-            ))}
-          </div>
-        </Panel>
-
-        <Panel title="WireGuard" icon={<LockKeyhole size={18} />} description="Remote clients 的最近 handshake 和 LAN return path 状态。">
-          <div className="presenceSummary">
-            <Metric label="Outside" value={`${ops.activeRemoteClients.length} 台`} tone={ops.activeRemoteClients.length ? "ok" : "neutral"} icon={<Globe2 size={18} />} />
-            <Metric label="Status" value={ops.remoteAccess.ok ? "ok" : "waiting"} tone={ops.remoteAccess.ok ? "ok" : "warn"} icon={<LockKeyhole size={18} />} />
-          </div>
-          <div className="presenceAps">
-            {ops.remoteClients.slice(0, 10).map((client) => (
-              <article key={`${client.name}-${client.ipv4_address}`}>
-                <b>{client.name || "unknown"}</b>
-                <span>{remoteStatusLabel(client)} · {client.ipv4_address || client.ipv6_address || ""}</span>
-                <em>{ageLabel(client.age_seconds)} ago</em>
-              </article>
-            ))}
-            {!ops.remoteClients.length && <EmptyLine text={ops.remoteAccess.error || "暂无 WireGuard 客户端状态。"} />}
-          </div>
-        </Panel>
-
-        <OpsNetworkPanel ops={ops.opsNetwork} />
-
-        <Panel title="Presence" icon={<Users size={18} />} description="由 OpenWrt Gateway 和 WRT Room 上报的 presence state。">
-          <div className="presenceSummary">
-            <Metric label="Home" value={`${ops.homeClients.length} 人`} tone={ops.presence.ok ? "ok" : "warn"} icon={<Home size={18} />} />
-            <Metric label="Fresh AP" value={`${(ops.presence.fresh_aps || []).length}/${(ops.presence.expected_aps || []).length || presenceAps.length || 0}`} tone={ops.presence.seen_all ? "ok" : "warn"} icon={<Wifi size={18} />} />
-          </div>
-          <div className="presencePeople">
-            {ops.homeClients.length ? ops.homeClients.map((client) => <span key={client}>{personLabel(client)}</span>) : <span>当前无人</span>}
-          </div>
-          <div className="presenceAps">
-            {presenceAps.map(([name, ap]) => (
-              <article key={name}>
-                <b>{name}</b>
-                <span>{(ap.clients || []).map(personLabel).join(", ") || "无人"}</span>
-                <em>{ageLabel(ap.age_seconds)} ago</em>
-              </article>
-            ))}
-            {!presenceAps.length && <EmptyLine text={ops.presence.error || "等待 presence 上报。"} />}
-          </div>
-        </Panel>
-      </div>
-    </section>
-  );
-}
-
-function OpsNetworkPanel({ ops }: { ops: OpsNetwork }) {
-  const checks = ops.checks || [];
-  const clients = ops.clients || [];
-  return (
-    <Panel title="Maintenance Wi-Fi" icon={<Wrench size={18} />} description="Independent maintenance SSID：使用 public DNS，bypass TProxy，保留 WAN 和 Pi maintenance access。">
-      <div className="presenceSummary">
-        <Metric label="SSID" value={ops.ssid || "Maintenance Wi-Fi"} tone={ops.ok ? "ok" : "warn"} icon={<Wifi size={18} />} />
-        <Metric label="Gateway" value={ops.gateway || "waiting"} tone={ops.gateway ? "ok" : "warn"} icon={<Router size={18} />} />
-      </div>
-      <div className="opsFacts">
-        <span>DHCP {ops.dhcp_range || "waiting"}</span>
-        <span>DNS {ops.dns || "waiting"}</span>
-        <span>{ops.proxy_bypassed ? "proxy bypassed" : "proxy check pending"}</span>
-        <span>{clients.length} clients</span>
-      </div>
-      <div className="healthList compact">
-        {checks.map((check, index) => (
-          <article className={statusClass(check.status)} key={`${check.title}-${index}`}>
-            {statusIcon(check.status)}
-            <span>
-              <b>{check.title}</b>
-              <p>{check.detail}</p>
-            </span>
-          </article>
-        ))}
-        {!checks.length && <EmptyLine text={ops.error || "等待 Maintenance Wi-Fi 采样。"} />}
-      </div>
-    </Panel>
-  );
-}
-
-function Troubleshoot({ state, ops }: { state: State; ops: OpsModel }) {
-  const checks = state.health?.checks || [];
-  const badHealth = checks.filter((check) => statusClass(check.status) !== "ok");
-  const badServices = ops.badServices;
-  const domains = state.incident?.domains || [];
-  const recovery = state.incident?.recovery_matrix || [];
-  const decisionSteps = state.incident?.decision_flow || [];
-  const wifiChecks = state.wifi_diagnostics?.checks || [];
-  const service = (key: string) => ops.services.find((item) => item.key === key);
-  const keyServices = ["openwrt-luci", "openwrt-ssh", "wrt-room-luci", "adguard", "mihomo", "homenet-ops", "uptime-kuma", "home-assistant", "wireguard", "cloudflared"]
-    .map(service)
-    .filter(Boolean) as HomeService[];
-
-  return (
-    <section className="troubleView">
-      <div className="sectionHeader">
-        <div>
-          <h2>Fix</h2>
-          <p>面向故障现场：先看故障域，再看证据和恢复命令。</p>
-        </div>
-      </div>
-      <div className="troubleGrid">
-        <Panel title="Decision Flow" icon={<Compass size={18} />} description="故障现场先按这个顺序排，不要从中间层开始猜。">
-          <div className="decisionList">
-            {decisionSteps.map((step) => (
-              <article className={statusClass(step.status)} key={step.id || step.question}>
-                <div>
-                  <b>{step.order}</b>
-                  {statusIcon(step.status)}
-                </div>
-                <span>
-                  <strong>{step.question}</strong>
-                  <p>{step.why_first}</p>
-                  {!!(step.if_bad || []).length && <em>{(step.if_bad || []).slice(0, 2).join(" / ")}</em>}
-                  {!!(step.entries || []).length && <code>{(step.entries || []).slice(0, 2).join(" · ")}</code>}
-                </span>
-              </article>
-            ))}
-            {!decisionSteps.length && <EmptyLine text="等待决策流采样。"/>}
-          </div>
-        </Panel>
-
-        <Panel title="Recovery Matrix" icon={<Wrench size={18} />} description="常见现象对应的第一检查点、后续证据和 source owner。">
-          <div className="recoveryMatrix">
-            {recovery.map((row) => (
-              <article className={statusClass(row.status)} key={`${row.symptom}-${row.start_domain}`}>
-                <header>
-                  {statusIcon(row.status)}
-                  <b>{row.symptom}</b>
-                </header>
-                <dl>
-                  <div><dt>Start</dt><dd>{row.start_domain}</dd></div>
-                  <div><dt>First</dt><dd>{row.first_probe}</dd></div>
-                  <div><dt>Then</dt><dd>{row.then_probe}</dd></div>
-                  <div><dt>Owner</dt><dd>{row.likely_owner}</dd></div>
-                  <div><dt>Avoid</dt><dd>{row.do_not_start_with}</dd></div>
-                </dl>
-              </article>
-            ))}
-            {!recovery.length && <EmptyLine text="等待常见故障矩阵。"/>}
-          </div>
-        </Panel>
-
-        <Panel title="Live Evidence" icon={<Activity size={18} />} description="来自 OpenWrt、Mihomo、AdGuard、WireGuard 和 service probes 的当前 evidence。">
-          <div className="runtimeGrid">
-            <Metric label="WAN" value={`${number(state.wan?.down_mbps)} Mbps`} icon={<Gauge size={18} />} />
-            <Metric label="Mihomo" value={`${number(state.mihomo?.down_mbps)} Mbps`} icon={<Globe2 size={18} />} />
-            <Metric label="Maintenance Wi-Fi" value={ops.opsNetwork.ok ? "ready" : "check"} tone={ops.opsNetwork.ok ? "ok" : "warn"} icon={<Wrench size={18} />} />
-            <Metric label="Health" value={`${checks.length - badHealth.length}/${checks.length || 0}`} tone={badHealth.length ? "warn" : "ok"} icon={<ShieldCheck size={18} />} />
-          </div>
-          <div className="entryList">
-            {keyServices.map((item) => (
-              <ServiceRow key={item.key || item.name} service={item} compact />
-            ))}
-          </div>
-        </Panel>
-
-        <Panel title="Fault Domains" icon={<Wrench size={18} />} description="按影响范围排序，优先恢复上游依赖。">
-          <div className="pathList">
-            {domains.map((domain) => (
-              <article className={statusClass(domain.status)} key={domain.id || domain.title}>
-                {statusIcon(domain.status)}
-                <span>
-                  <b>{domain.title}</b>
-                  <p>{domain.detail}</p>
-                  <em><strong>Evidence</strong> {domain.evidence}</em>
-                  <em><strong>Next</strong> {domain.next_action}</em>
-                  {!!(domain.commands || []).length && <em><strong>Command</strong> {(domain.commands || [])[0]}</em>}
-                </span>
-              </article>
-            ))}
-            {!domains.length && <EmptyLine text="等待故障域采样。"/>}
-          </div>
-        </Panel>
-
-        <Panel title="Wi-Fi 5G / Room Backhaul" icon={<Wifi size={18} />} description="断电来电后重点看 radio1、Room backhaul 和卧室 WRT。">
-          <div className="healthList">
-            {wifiChecks.map((check, index) => (
-              <article className={statusClass(check.status)} key={`${check.title}-${index}`}>
-                {statusIcon(check.status)}
-                <span>
-                  <b>{check.title}</b>
-                  <p>{check.detail}</p>
-                </span>
-              </article>
-            ))}
-            {!wifiChecks.length && <EmptyLine text={state.wifi_diagnostics?.error || "等待 Wi-Fi 采样。"} />}
-          </div>
-        </Panel>
-
-        <Panel title="Current Problems" icon={<AlertTriangle size={18} />} description="Service probes 或 Health Checks 的异常集中列在这里。">
-          <div className="healthList">
-            {badHealth.slice(0, 8).map((check, index) => (
-              <article className={statusClass(check.status)} key={`${check.title}-${index}`}>
-                {statusIcon(check.status)}
-                <span>
-                  <b>{check.title}</b>
-                  <p>{check.detail}</p>
-                </span>
-              </article>
-            ))}
-            {badServices.slice(0, 8).map((item) => <ServiceRow key={item.key || item.name} service={item} compact />)}
-            {!badHealth.length && !badServices.length && <EmptyLine text="当前没有明显异常。"/>}
-          </div>
-        </Panel>
-      </div>
-    </section>
-  );
-}
-
-type TopologyNodeModel = {
-  id: string;
-  title: string;
-  detail: string;
-  meta?: string;
-  tone?: "access" | "router" | "core" | "proxy" | "client" | "service";
-  status?: Status;
-};
-
-type TopologyLinkModel = {
-  from: string;
-  to: string;
-  label: string;
-  kind?: "primary" | "support";
-};
-
-type TopologyLaneModel = {
-  id: string;
-  title: string;
-  description: string;
-  nodes: TopologyNodeModel[];
-  links: TopologyLinkModel[];
-};
-
-function buildTopology(state: State) {
-  const instance = state.instance || {};
-  const networks = instance.networks || {};
-  const wifi = instance.wifi || {};
-  const expectedDevices = instance.devices || [];
-  const expectedServices = instance.services || [];
-  const deviceById = (id: string) => expectedDevices.find((device) => device.id === id);
-  const gatewayDevice = deviceById("openwrt-gateway");
-  const roomDevice = deviceById("wrt-room");
-  const piDevice = deviceById("raspberrypi");
-  const lan = networks.lan || {};
-  const opsNet = networks.ops || {};
-  const mainWifi = wifi.main || {};
-  const roomWifi = wifi.relay_5g || {};
-  const ingress = state.ingress || [];
-  const services = state.home_services || [];
-  const activeDevices = (state.devices || []).slice(0, 6);
-  const topRoute = (state.route_summary || [])[0];
-  const topDns = (state.dns_top_hosts || [])[0];
-  const serviceCount = services.length;
-  const okCount = services.filter((service) => statusClass(service.status) === "ok").length;
-  const badCount = services.filter((service) => statusClass(service.status) === "bad").length;
-  const wanDown = number(state.wan?.down_mbps);
-  const wanUp = number(state.wan?.up_mbps);
-  const mihomoDown = number(state.mihomo?.down_mbps);
-  const mihomoUp = number(state.mihomo?.up_mbps);
-  const activeNames = activeDevices.map((device) => device.name || device.ip || "unknown");
-  const apEntries = Object.entries(state.presence?.aps || {});
-  const freshAps = state.presence?.fresh_aps || [];
-  const reportedClientCount = state.presence?.merged_clients?.length || 0;
-  const mainAp = apEntries.find(([name]) => name.toLowerCase().includes("main") || name.toLowerCase().includes("openwrt"));
-  const roomAp = apEntries.find(([name]) => name.toLowerCase().includes("room") || name.toLowerCase().includes("wrt"));
-  const mainDetail = mainAp ? `${mainAp[0]} · ${mainAp[1].clients?.length || 0} clients` : `${gatewayDevice?.ip || lan.gateway || "192.168.50.1"} · ${mainWifi.ssid || "Main Wi-Fi"}`;
-  const roomDetail = roomAp ? `${roomAp[0]} · ${roomAp[1].clients?.length || 0} clients` : `${roomDevice?.ip || "192.168.50.2"} · ${roomWifi.ssid || "Room backhaul"}`;
-  const clientDetail = reportedClientCount ? `${reportedClientCount} clients reported` : `${activeDevices.length} active now`;
-  const ops = state.ops_network || {};
-  const accessCount = ingress.filter((item) => statusClass(item.status) === "ok").length;
-  const serviceHosts = Array.from(new Map(
-    services
-      .flatMap((service) => (service.ports || []).map((port) => ({
-        host: port.host || "",
-        owner: port.owner || service.name || service.key || "service"
-      })))
-      .filter((item) => item.host)
-      .map((item) => [item.host, item])
-  ).values());
-  const hostSummary = serviceHosts.length
-    ? serviceHosts.slice(0, 4).map((item) => item.host).join(", ")
-    : "LAN service hosts";
-  const expectedServiceHosts = Array.from(new Set(expectedServices.map((service) => service.host).filter(Boolean)));
-
-  const lanes: TopologyLaneModel[] = [
-    {
-      id: "remote",
-      title: "外部访问",
-      description: "Remote Ingress 不依赖家庭 Wi-Fi，由 Cloudflare、IPv6 direct 和 WireGuard 分担。",
-      nodes: [
-        { id: "internet", title: "Internet", detail: `WAN ${wanDown}/${wanUp} Mbps`, tone: "access", status: state.ok ? "ok" : "warn" },
-        { id: "cloudflare", title: "Cloudflare Access / Tunnel", detail: `${accessCount}/${ingress.length || 0} entries ok`, meta: "ops / ha / launcher", tone: "access", status: accessCount ? "ok" : "warn" },
-        { id: "ipv6", title: "IPv6 Direct", detail: "Caddy + WireGuard UDP", meta: "instance remote entry", tone: "access", status: "ok" },
-        { id: "edge-host", title: "Edge Host", detail: "cloudflared / Caddy / wg-easy", meta: `currently ${piDevice?.ip || "192.168.50.5"}`, tone: "core", status: "ok" },
-        { id: "remote-services", title: "Home Services", detail: "HomeNet / HA / Kuma / others", meta: `${okCount}/${serviceCount || 0} services ok`, tone: "service", status: badCount ? "warn" : "ok" }
-      ],
-      links: [
-        { from: "Internet", to: "Cloudflare Access", label: "declared HTTPS entries" },
-        { from: "Internet", to: "IPv6 Direct", label: "Kuma HTTPS / WireGuard UDP" },
-        { from: "Cloudflare", to: "Edge Host", label: "outbound tunnel" },
-        { from: "IPv6 Direct", to: "Edge Host", label: "Caddy / UDP" },
-        { from: "Edge Host", to: "Home Services", label: "local upstream" }
-      ]
-    },
-    {
-      id: "home",
-      title: "家里上网",
-      description: "Clients 接入 OpenWrt Gateway 或 WRT Room；DNS、Proxy 和 services 可以分布在多个 LAN hosts。",
-      nodes: [
-        { id: "clients", title: "Clients", detail: clientDetail, meta: activeNames.length ? activeNames.join(", ") : "no active traffic", tone: "client", status: activeDevices.length ? "ok" : "unknown" },
-        { id: "main-router", title: gatewayDevice?.name || "OpenWrt 主路由", detail: mainDetail, meta: `${lan.cidr || "192.168.50.0/24"} · ${mainWifi.ssid || "Main Wi-Fi"}`, tone: "router", status: "ok" },
-        { id: "room-router", title: roomDevice?.name || "卧室 WRT", detail: roomDetail, meta: `${roomDevice?.ip || "192.168.50.2"} · bedroom coverage`, tone: "router", status: roomAp || freshAps.includes("room") ? "ok" : "warn" },
-        { id: "service-hosts", title: "Service Hosts", detail: `${serviceHosts.length || expectedServices.length || 1} services`, meta: hostSummary || expectedServiceHosts.join(", "), tone: "core", status: badCount ? "warn" : "ok" },
-        { id: "dns", title: "DNS", detail: topDns?.host || "AdGuard -> Mihomo DNS", meta: "domestic split + fake-ip", tone: "service", status: "ok" },
-        { id: "proxy", title: "Mihomo", detail: topRoute?.chain || "idle", meta: `${mihomoDown}/${mihomoUp} Mbps`, tone: "proxy", status: topRoute ? "ok" : "unknown" },
-        { id: "wan", title: "WAN", detail: `PPPoE ${wanDown}/${wanUp} Mbps`, meta: "OpenWrt egress", tone: "access", status: state.ok ? "ok" : "warn" }
-      ],
-      links: [
-        { from: "Clients", to: "OpenWrt 主路由", label: "main Wi-Fi / LAN" },
-        { from: "Clients", to: "卧室 WRT", label: "room Wi-Fi", kind: "support" },
-        { from: "卧室 WRT", to: "OpenWrt 主路由", label: "wireless relay", kind: "support" },
-        { from: "OpenWrt 主路由", to: "Service Hosts", label: "LAN services" },
-        { from: "Service Hosts", to: "DNS", label: "AdGuard" },
-        { from: "Service Hosts", to: "Mihomo", label: "proxy core" },
-        { from: "OpenWrt 主路由", to: "WAN", label: "direct + bypass" },
-        { from: "Mihomo", to: "WAN", label: "proxied egress" }
-      ]
-    },
-    {
-      id: "rescue",
-      title: "运维通道",
-      description: "主 Proxy 或 DNS 出问题时，Maintenance Wi-Fi 保留 WAN 和 Pi maintenance access。",
-      nodes: [
-        { id: "maintenance-wifi", title: wifi.ops?.ssid || "Maintenance Wi-Fi", detail: ops.gateway || opsNet.gateway || "192.168.40.1", meta: `DHCP ${ops.dhcp_range || "100-149"} · ${opsNet.cidr || ""}`.trim(), tone: "router", status: ops.ok ? "ok" : "warn" },
-        { id: "public-dns", title: "Public DNS", detail: ops.dns || "119.29.29.29 / 223.5.5.5 / 1.1.1.1", meta: "bypass transparent proxy", tone: "service", status: ops.proxy_bypassed ? "ok" : "warn" },
-        { id: "pi-maintenance", title: "Pi Maintenance", detail: "SSH 22 / HomeNet 9999", meta: "192.168.50.5", tone: "core", status: ops.ok ? "ok" : "warn" },
-        { id: "internet-rescue", title: "Internet", detail: "direct WAN", meta: "device runs its own proxy if needed", tone: "access", status: ops.ok ? "ok" : "warn" }
-      ],
-      links: [
-        { from: "Device", to: "Maintenance Wi-Fi", label: "manual connect" },
-        { from: "Maintenance Wi-Fi", to: "Public DNS", label: "no transparent proxy" },
-        { from: "Maintenance Wi-Fi", to: "Pi Maintenance", label: "SSH / local HomeNet" },
-        { from: "Maintenance Wi-Fi", to: "Internet", label: "direct egress" }
-      ]
-    }
-  ];
-
-  return {
-    lanes,
-    facts: [
-      { label: "Services", value: `${okCount}/${serviceCount || 0} ok`, tone: badCount ? "warn" : "ok" },
-      { label: "WAN", value: `${wanDown}/${wanUp} Mbps`, tone: state.ok ? "ok" : "warn" },
-      { label: "Proxy", value: topRoute?.chain || "idle", tone: topRoute ? "ok" : "neutral" },
-      { label: "AP reports", value: freshAps.length ? freshAps.join(", ") : "waiting", tone: freshAps.length ? "ok" : "warn" },
-      { label: "Active clients", value: activeNames.length ? activeNames.join(", ") : "none", tone: activeNames.length ? "ok" : "neutral" }
-    ]
-  };
-}
-
 function Topology({ state }: { state: State }) {
   const domainStatus = (id: string, fallback: Status = "unknown") => state.incident?.domains?.find((item) => item.id === id)?.status || fallback;
   const ops = state.ops_network || {};
   const roomOk = state.wifi_diagnostics?.room_reachable;
+  const roomIp = state.instance?.devices?.find((device) => device.id === "wrt-room")?.ip || "声明的管理地址";
+  const devices = deviceInventory(state);
+  const macStudio = devices.find((device) => device.id === "macstudio" || device.id === "macstudio-wifi");
+  const wifiChecks = state.wifi_diagnostics?.checks || [];
+  const radioCheck = wifiChecks.find((check) => `${check.title || ""}`.includes("radio1"));
+  const roomCheck = wifiChecks.find((check) => `${check.title || ""}`.includes("卧室 WRT")) || state.incident?.domains?.find((item) => item.id === "room-ap");
+  const serverDomain = state.incident?.domains?.find((item) => item.id === "server-runtime");
+  const powerRecovery = [
+    {
+      title: "主路由 5G",
+      status: radioCheck?.status || domainStatus("main-wifi-5g", state.wifi_diagnostics?.ok ? "ok" : "warn"),
+      detail: radioCheck?.detail || "确认 radio1、主 Wi-Fi 5G 和卧室回程 SSID。",
+      action: "5G 不起时只处理 radio1，不改 DNS/Proxy。"
+    },
+    {
+      title: "卧室 WRT",
+      status: roomCheck?.status || (roomOk ? "ok" : "warn"),
+      detail: roomCheck?.detail || (roomOk ? `${roomIp} 可达` : `${roomIp} 暂不可达`),
+      action: "主 5G 正常后再看回程、电源和房间侧后台。"
+    },
+    {
+      title: "Pi 服务",
+      status: serverDomain?.status || (state.ok ? "ok" : "warn"),
+      detail: serverDomain?.evidence || `${state.home_services?.filter((service) => statusClass(service.status) === "ok").length || 0}/${state.home_services?.length || 0} 服务正常`,
+      action: "多个服务一起坏时先看 Docker/systemd。"
+    },
+    {
+      title: "Mac Studio",
+      status: macStudio?.status || "unknown",
+      detail: macStudio?.detail || "未在当前 DHCP/流量证据中看到",
+      action: "关机或 FileVault 登录前不可远程桌面，先确认电源和系统登录状态。"
+    }
+  ];
   const paths = [
     {
       id: "daily",
@@ -1525,8 +1137,8 @@ function Topology({ state }: { state: State }) {
       title: "卧室覆盖",
       status: domainStatus("room-ap", roomOk ? "ok" : "warn"),
       route: ["手机/电脑", "Main Wi-Fi", "卧室 WRT", "主路由"],
-      note: roomOk ? "主网侧 192.168.50.2 可达" : "卧室 WRT 等待确认",
-      action: "主网/Pi 用 192.168.50.2；手机连卧室 WRT 下时用 192.168.50.1。"
+      note: roomOk ? `主网侧 ${roomIp} 可达` : "卧室 WRT 等待确认",
+      action: "主网侧用声明的管理地址；直接连房间 AP 时看本机网关。"
     },
     {
       id: "remote",
@@ -1539,7 +1151,7 @@ function Topology({ state }: { state: State }) {
     {
       id: "rescue",
       title: "检修通道",
-      status: domainStatus("rescue", ops.ok ? "ok" : "warn"),
+      status: domainStatus("rescue-path", ops.ok ? "ok" : "warn"),
       route: ["维护设备", ops.ssid || "Maintenance Wi-Fi", "公共 DNS / 直出", "Pi :9999"],
       note: ops.ok ? "检修 Wi-Fi 就绪" : "检修 Wi-Fi 需要确认",
       action: "主网络复杂路径坏了，用它进 Pi 和 Codex 排查。"
@@ -1547,114 +1159,42 @@ function Topology({ state }: { state: State }) {
   ];
 
   return (
-    <div className="simpleTopology" aria-label="Home network topology">
-      {paths.map((path) => (
-        <article className={statusClass(path.status)} key={path.id}>
-          <header>
-            {statusIcon(path.status)}
-            <div>
-              <h3>{path.title}</h3>
-              <p>{path.note}</p>
-            </div>
-            <b>{shortStatus(path.status)}</b>
-          </header>
-          <div className="routeLine">
-            {path.route.map((item) => <span key={`${path.id}-${item}`}>{item}</span>)}
-          </div>
-          <p>{path.action}</p>
-        </article>
-      ))}
-    </div>
-  );
-}
-
-function TopologyCard({ node }: { node: TopologyNodeModel }) {
-  return (
-    <article className={`topologyCard ${node.tone || ""} ${statusClass(node.status)}`}>
-      <div>
-        <span className="statusDot" />
-        <h4>{node.title}</h4>
-      </div>
-      <b>{node.detail}</b>
-      {node.meta && <p>{node.meta}</p>}
-    </article>
-  );
-}
-
-function ModulePlanView({ state }: { state: State }) {
-  const plan = state.plan || {};
-  const modules = plan.modules || [];
-  if (!plan.ok && !modules.length) {
-    return (
-      <Panel title="Module Plan" icon={<Layers3 size={18} />} description="homenet.plan.v1 暂时不可用。">
-        <EmptyLine text={plan.error || "等待 HomeNet plan 生成。"} />
-      </Panel>
-    );
-  }
-
-  const primary = modules.filter((module) => [
-    "gateway-openwrt",
-    "dns-layer",
-    "proxy-mihomo",
-    "remote-access",
-    "observability-homenet",
-    "maintenance-wifi"
-  ].includes(module.id || ""));
-  const visible = primary.length ? primary : modules.slice(0, 6);
-
-  return (
-    <section className="modulePlanSection">
-      <div className="sectionHeader">
-        <div>
-          <h2>Module Plan</h2>
-          <p>{plan.schema || "homenet.plan.v1"} · {plan.profile || "profile"} · read-only module plan</p>
-        </div>
-      </div>
-      <div className="modulePlanGrid">
-        {visible.map((module) => (
-          <article className="modulePlanCard" key={module.id || module.title}>
+    <>
+      <div className="simpleTopology" aria-label="Home network topology">
+        {paths.map((path) => (
+          <article className={statusClass(path.status)} key={path.id}>
             <header>
-              <b>{module.title || module.id}</b>
-              <span>{module.placement || "placement"}</span>
+              {statusIcon(path.status)}
+              <div>
+                <h3>{path.title}</h3>
+                <p>{path.note}</p>
+              </div>
+              <b>{shortStatus(path.status)}</b>
             </header>
-            <p>{(module.outputs || [])[0] || (module.inputs || [])[0] || "module"}</p>
-            <dl>
-              <div>
-                <dt>Checks</dt>
-                <dd>{(module.checks || []).slice(0, 2).join(" / ") || "not declared"}</dd>
-              </div>
-              <div>
-                <dt>Rollback</dt>
-                <dd>{(module.rollback || []).slice(0, 2).join(" / ") || "not declared"}</dd>
-              </div>
-            </dl>
+            <div className="routeLine">
+              {path.route.map((item) => <span key={`${path.id}-${item}`}>{item}</span>)}
+            </div>
+            <p>{path.action}</p>
           </article>
         ))}
       </div>
-    </section>
-  );
-}
 
-function Metric({ label, value, icon, tone = "neutral" }: { label: string; value: string; icon: React.ReactNode; tone?: "neutral" | "ok" | "warn" }) {
-  return (
-    <article className={`metric ${tone}`}>
-      {icon}
-      <span>{label}</span>
-      <b>{value}</b>
-    </article>
-  );
-}
-
-function LoadMeter({ label, down, up }: { label: string; down?: number; up?: number }) {
-  const total = Math.min(100, Math.max(2, ((down || 0) + (up || 0)) * 6));
-  return (
-    <article className="loadMeter">
-      <div>
-        <b>{label}</b>
-        <span>{number(down)} down · {number(up)} up</span>
-      </div>
-      <em><i style={{ width: `${total}%` }} /></em>
-    </article>
+      <Panel title="断电恢复" icon={<RadioTower size={18} />} description="来电后只看这四项；它们正常后，再处理单个服务或设备。">
+        <div className="recoveryGrid">
+          {powerRecovery.map((item) => (
+            <article className={statusClass(item.status)} key={item.title}>
+              <header>
+                {statusIcon(item.status)}
+                <span>{item.title}</span>
+                <b>{shortStatus(item.status)}</b>
+              </header>
+              <p>{item.detail}</p>
+              <em>{item.action}</em>
+            </article>
+          ))}
+        </div>
+      </Panel>
+    </>
   );
 }
 
@@ -1670,6 +1210,7 @@ function Panel({ title, icon, description, children }: { title: string; icon: Re
 
 function ServiceCard({ service }: { service: HomeService }) {
   const links = serviceLinks(service);
+  const hasWebUi = links.length > 0;
   return (
     <article className={`serviceCard ${statusClass(service.status)}`}>
       <div className="serviceHead">
@@ -1679,6 +1220,8 @@ function ServiceCard({ service }: { service: HomeService }) {
       <p>{service.role || service.kind || "service"}</p>
       <div className="serviceMeta">
         <span>{service.detail || service.status || "unknown"}</span>
+        <span>{portSummary(service.ports || [])}</span>
+        {!hasWebUi && <span>无 Web UI</span>}
         {typeof service.latency_ms === "number" && <span>{service.latency_ms} ms</span>}
       </div>
       <ServicePorts ports={service.ports || []} />
@@ -1697,7 +1240,7 @@ function ServicePorts({ ports }: { ports: PortEntry[] }) {
     <div className="portChips">
       {ports.map((port, index) => (
         <span key={`${port.host}-${port.port}-${port.proto}-${index}`} title={`${port.service || ""} · ${port.scope || ""} · ${port.note || ""}`}>
-          {port.host || ""}:{port.port || ""}/{port.proto || ""}
+          {port.port || ""}/{port.proto || ""} · {portScopeLabel(port.scope)}
         </span>
       ))}
     </div>
@@ -1717,19 +1260,6 @@ function ServiceRow({ service, compact = false }: { service: HomeService | Ingre
         {links.map((link) => <a key={`${service.key}-${link.label}`} href={link.href} target="_blank" rel="noreferrer">{link.label}</a>)}
       </div>
     </article>
-  );
-}
-
-function DataTable({ rows, empty }: { rows: string[][]; empty: string }) {
-  if (!rows.length) return empty ? <EmptyLine text={empty} /> : null;
-  return (
-    <div className="dataTable">
-      {rows.map((row, index) => (
-        <article key={`${row.join("-")}-${index}`}>
-          {row.map((cell, cellIndex) => <span key={cellIndex}>{cell}</span>)}
-        </article>
-      ))}
-    </div>
   );
 }
 

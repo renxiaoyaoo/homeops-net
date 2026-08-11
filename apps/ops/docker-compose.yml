@@ -6,8 +6,11 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      OPENWRT_HOST: 192.168.50.1
+      OPENWRT_HOST: ${OPENWRT_HOST:-192.168.50.1}
       OPENWRT_USER: root
+      HOMENET_SERVER_IP: ${HOMENET_SERVER_IP:-192.168.50.5}
+      ROOM_AP_IP: ${ROOM_AP_IP:-192.168.50.2}
+      ROOM_AP_LOCAL_IP: ${ROOM_AP_LOCAL_IP:-192.168.1.1}
       WAN_IF: pppoe-wan
       MIHOMO_URL: http://127.0.0.1:9090
       MIHOMO_CONFIG: /mihomo-config.yaml
@@ -16,8 +19,11 @@ services:
       ROUTING_RULES_STORE: /runtime/routing/rules.json
       ROUTING_RULE_DIR: /mihomo-rules
       ADGUARD_DOMESTIC_FILE: /adguard-conf/upstream-domestic.conf
-      HEALTH_INTERVAL: 30
-      REFRESH: 15
+      HEALTH_INTERVAL: ${HEALTH_INTERVAL:-90}
+      SERVICE_PROBE_INTERVAL: ${SERVICE_PROBE_INTERVAL:-60}
+      HEAVY_PROBE_INTERVAL: ${HEAVY_PROBE_INTERVAL:-120}
+      DHCP_INTERVAL: ${DHCP_INTERVAL:-60}
+      REFRESH: ${REFRESH:-15}
       PORT: 9999
     volumes:
       - /home/pi/.ssh:/root/.ssh:ro
@@ -30,6 +36,6 @@ services:
       - ${HOMENET_WORKSPACE:-/home/pi/network}/adguard/conf:/adguard-conf:ro
       - ${HOMENET_WORKSPACE:-/home/pi/network}/maintenance/state:/maintenance-state:ro
       - ${HOMENET_INSTANCE_PATH:-/home/pi/network/instances/example-openwrt-pi}:/homenet-instance:ro
-      - ${HOMENET_WORKSPACE:-/home/pi/network}/tools:/homenet-tools:ro
+      - ${HOMENET_WORKSPACE:-/home/pi/network}/tools:/tools:ro
       - ${HOMENET_WORKSPACE:-/home/pi/network}/modules:/modules:ro
       - ${HOMENET_WORKSPACE:-/home/pi/network}/schemas:/schemas:ro

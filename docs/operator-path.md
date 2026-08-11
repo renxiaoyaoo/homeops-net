@@ -52,21 +52,17 @@ change, verify before moving on:
 ./homenet doctor --instance instances/my-home --live
 ```
 
-Use advanced review and module internals only after the main path is clear or
-when maintaining the HomeNet core:
+Use advanced review only after the main path is clear or when maintaining the
+HomeNet core:
 
 ```sh
 ./homenet deploy --instance instances/my-home --dry-run
-./homenet apply --instance instances/my-home --dry-run
 ./homenet bundle --instance instances/my-home --output /tmp/homenet-review
 ./homenet modules --instance instances/my-home
-./homenet module-definitions
-./homenet module-artifacts
-./homenet module-renderers
-./homenet module-implementations
-./homenet module-executors
-./homenet module-backups
 ```
+
+Module internals, future apply, backup, executor, and release commands are
+cataloged in `docs/function-boundary.md`; they are not part of daily operation.
 
 For a server-runtime profile, `templates/compose/` provides a public Docker
 Compose starting point. Copy it into a private deployment directory, fill a
@@ -180,26 +176,17 @@ Before publishing or handing work to another operator, run:
 ```sh
 ./homenet privacy --scope public
 ./homenet privacy --scope all --instance instances/my-home
-./homenet release --instance instances/my-home
-./homenet package --instance instances/my-home
 ./homenet package --instance instances/my-home --output-dir /tmp/homenet-public
 ./homenet package-check --dir /tmp/homenet-public
 ./homenet package-smoke --dir /tmp/homenet-public
-./homenet package-onboarding --dir /tmp/homenet-public --work-dir /tmp/homenet-package-onboarding --force
-./homenet publish-check --dir /tmp/homenet-public --work-dir /tmp/homenet-publish-check --force
-./homenet release-candidate --instance instances/my-home --output-dir /tmp/homenet-public --repo-dir /tmp/homenet-public-repo --force
-./homenet repo-init --dir /tmp/homenet-public --repo-dir /tmp/homenet-public-repo --force
-./homenet publish-audit --instance instances/my-home --dir /tmp/homenet-public --repo-dir /tmp/homenet-public-repo --run-publish-check --force
-./homenet repo-publish --instance instances/my-home --dir /tmp/homenet-public --repo-dir /tmp/homenet-public-repo --remote <public-repo-url> --confirm-push PUSH-HOMENET-PUBLIC --force
-./homenet repo-plan --dir /tmp/homenet-public
 ./homenet workspace --instance instances/my-home
-./homenet progress --instance instances/my-home
-./homenet module-implementations
 ./homenet check --instance instances/my-home
 ./homenet deploy --instance instances/my-home --force --check-idempotent
 ```
 
-`release-candidate` creates the local public package and local public git repo
+Maintainers preparing an official public repo can additionally use
+`release-candidate`, `publish-check`, `repo-init`, `publish-audit`,
+`repo-publish`, and `repo-plan`. `release-candidate` creates the local public package and local public git repo
 without adding a remote or pushing. `repo-init` defaults to a lightweight
 review precheck so creating the local public repo is quick. `publish-check`,
 `publish-audit --run-publish-check`, and confirmed

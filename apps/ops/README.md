@@ -1,29 +1,27 @@
 # HomeNet Ops
 
-HomeNet Ops 是当前家庭网络的 operations surface。它不替代 Uptime Kuma、AdGuard、Mihomo Dashboard 或 Home Assistant，而是把 Service Directory、Topology、Access、Health 和 troubleshooting evidence 放到同一个地方。
+HomeNet Ops 是当前家庭网络的轻量 operations surface。它不替代 Uptime Kuma、AdGuard、Mihomo Dashboard 或 Home Assistant，只负责把“现在是否正常、坏在哪、从哪里进去、下一步做什么”放到一个页面里。
 
-- Overview：Daily entries、Blueprint、状态摘要和需要关注的事项。
-- Topology：Remote Ingress、Service Hosts、OpenWrt Gateway、家庭服务、DNS 和 Proxy path 的当前拓扑。
-- Services：Service Directory 和 service probes，覆盖 HA、Kuma、Caddy、wg-easy、FileBrowser、Mosquitto、AdGuard、Mihomo、Zigbee2MQTT、Asset Guardian、Balcony Grow、Shadowbroker、systemd tasks 和 UDP entries。
-- Network：LAN client traffic、Mihomo outbound chains、domain traffic 和 DNS hotspots。
-- Access：Cloudflare Access/Tunnel、WireGuard return path、Maintenance Wi-Fi 和 presence state。
-- Fix：按 symptom 组织 troubleshooting path，并绑定 `homenet.plan.v1` 里的 Gateway、DNS、Proxy、Tunnel、Room AP、Maintenance Wi-Fi 等 module Checks / Rollback。
-- Health：read-only checks，验证 AdGuard DNS split、Mihomo fake-ip、OpenWrt `MIHOMO_CN4` 和 domestic DIRECT path。
+- Overview：当前结论、异常域、常用入口和下一步。
+- Topology：家庭网络主路径、外部回家路径、检修通道和断电恢复检查。
+- Services：按职责分组的服务目录、LAN/remote link 和端口用途。
+- Routing：临时分流和永久规则候选。
 
-边界：
+职责分工：
 
 - OpenWrt 仍是 Gateway、DHCP、防火墙、policy routing 的源头。
 - AdGuard 仍是 DNS、广告拦截、查询日志的源头。
 - Mihomo 仍是 rule matching、proxy groups、outbound chains 的源头。
-- Uptime Kuma 仍是 availability monitoring、status page、notification 的源头。
-- Home Assistant 仍是家庭自动化和设备控制的源头。
-- HomeNet Ops 只做 fusion layer：把上述 evidence 按 device、service、entry、traffic path 和 timeline 组织起来。
+- Home Assistant 负责家庭自动化和设备控制。
+- Uptime Kuma 负责通知告警和可用性历史。
+- Cloudflare Access/Tunnel 负责受保护的外部入口。
+- HomeNet Ops 负责日常入口、当前状态、排障路径和配置来源提示；它只读观察，不代替源系统改配置。
 
 ## 技术栈
 
 - 后端：`aiohttp`，继续复用现有 OpenWrt / Mihomo / AdGuard 采集逻辑，常驻模式下默认 15 秒采样一次。
 - 前端：`React + TypeScript + Vite`，源码在 `frontend/`，构建产物在 `static/`。
-- 视觉核心：React 页面内的 Overview、Topology、Service Directory 和 status panels。
+- 视觉核心：React 页面内的 Overview、Topology、Services 和 Routing。
 - 运行方式：一个 `homenet-ops` 容器直接监听 `9999`，不再额外维护 gate。
 - 静态 metadata：通过只读挂载的 `/homenet-tools/homenet.py metadata` 生成 `homenet.metadata.v1`。部署时把私有 instance 目录挂载到 `/homenet-instance`。
 - Blueprint：Ops 从同一份 metadata 派生 `homenet.blueprint.v1` 摘要，展示 HomeNet 的 product contract、active/fallback capabilities、operational questions 和 Source of Truth。
@@ -33,7 +31,7 @@ Primary operations entry：declared by the deployment instance remote entries, f
 
 LAN entries：`http://home.lan/` 或 `http://ops.lan/`
 
-Fallback direct entry：`http://192.168.50.5:9999`
+Fallback direct entry：`http://<server-lan-ip>:9999`
 
 HomeNet Ops 容器直接监听 `9999`，由 Docker `restart: unless-stopped` 保持常驻。
 
@@ -67,7 +65,7 @@ HomeNet 只做只读检查，不自动生成系统配置快照。
 homenet-ops url
 ```
 
-然后打开 `http://192.168.50.5:9999`。
+然后打开脚本输出的地址，或使用 `http://<server-lan-ip>:9999`。
 
 首次使用或代码依赖变化后构建镜像：
 
@@ -109,8 +107,8 @@ homenet-ops view
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" 2>/dev/null || true
-ssh-copy-id root@192.168.50.1
-ssh root@192.168.50.1 'echo ok'
+ssh-copy-id root@<openwrt-lan-ip>
+ssh root@<openwrt-lan-ip> 'echo ok'
 ```
 
 然后重启：

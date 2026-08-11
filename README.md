@@ -21,6 +21,8 @@ HomeNet 是一套可复用的家庭网络运维方案。它用 OpenWrt 做 Gatew
 
 HomeNet Ops 和 `homenet status` 都是 diagnostic-first：打开先看 Gateway/WAN、Wi-Fi radio、卧室 WRT、DNS/Proxy、Server Runtime、Remote Access、Smart Home / Apple Home、Rescue Path 和单设备身份，再进入服务清单、拓扑和工具入口。`status --live` 会把只读探针结果归到这些故障域，方便先定位层级再处理。
 
+功能面按主线、辅助和高级审计分层维护，见 [docs/function-boundary.md](/home/pi/network/docs/function-boundary.md)。日常不要从完整命令索引开始。
+
 ## 新部署最短路径
 
 新部署一个家时，不要先读完整命令索引。`./homenet --help` 只显示主路径；
@@ -202,22 +204,16 @@ workspace 分离到私有目录或私有仓库，只复制 `site.yaml`、`device
 ```sh
 ./homenet privacy --scope public
 ./homenet package --instance instances/my-home --output-dir /tmp/homenet-public
-./homenet release-candidate --instance instances/my-home --output-dir /tmp/homenet-public --repo-dir /tmp/homenet-public-repo --force
-./homenet publish-check --dir /tmp/homenet-public --work-dir /tmp/homenet-publish-check --force
-./homenet repo-init --dir /tmp/homenet-public --repo-dir /tmp/homenet-public-repo --force
-./homenet publish-audit --instance instances/my-home --dir /tmp/homenet-public --repo-dir /tmp/homenet-public-repo --run-publish-check --force
-./homenet repo-publish --instance instances/my-home --dir /tmp/homenet-public --repo-dir /tmp/homenet-public-repo --remote <public-repo-url> --confirm-push PUSH-HOMENET-PUBLIC --force
+./homenet package-check --dir /tmp/homenet-public
+./homenet package-smoke --dir /tmp/homenet-public
 ```
 
 当前 `/home/pi/network` 也可以直接作为公开 repo clone 开发和推送 public core；
 前提是先跑 privacy/check，并且 private instance、runtime、secrets 和 nested
 private project 都保持 ignored/untracked。
 
-导出的包会包含 `PUBLIC_PACKAGE.md`，它是给包接收者看的第一入口。
-导出的 public repo 也包含 `.github/workflows/ci.yml`，用于在 GitHub 上自动跑 public privacy、example CI、package check 和 package smoke。
-`release-candidate` 会生成本地公开包和本地公开 git repo，但不会添加 remote 或 push。
-`repo-init` 默认只做轻量 review precheck，避免创建本地公开仓库时重复跑重检查；
-真正 `repo-publish --confirm-push PUSH-HOMENET-PUBLIC` 时会自动跑完整 publish check。
+导出的包会包含 `PUBLIC_PACKAGE.md`，它是给包接收者看的第一入口。发布者才需要继续使用
+`release-candidate`、`publish-check`、`repo-init`、`publish-audit`、`repo-publish`。
 
 ## 维护前检查
 
@@ -243,6 +239,7 @@ npm run build
 ## 延伸文档
 
 - [docs/operator-path.md](/home/pi/network/docs/operator-path.md)：维护者最短路径。
+- [docs/function-boundary.md](/home/pi/network/docs/function-boundary.md)：哪些功能是主线、辅助、高级审计或暂不做。
 - [docs/minimal-deployment.md](/home/pi/network/docs/minimal-deployment.md)：最小部署形态和不做什么。
 - [docs/deployment-and-adoption.md](/home/pi/network/docs/deployment-and-adoption.md)：部署、使用和接管主路径。
 - [docs/source-tool-runbook.md](/home/pi/network/docs/source-tool-runbook.md)：OpenWrt、DNS、Proxy、server runtime、Cloudflare/Kuma 等 source tool 操作手册。
