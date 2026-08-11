@@ -25,6 +25,7 @@ OPENWRT_HOST = os.getenv("OPENWRT_HOST", "192.168.50.1")
 OPENWRT_USER = os.getenv("OPENWRT_USER", "root")
 ROOM_AP_IP = os.getenv("ROOM_AP_IP", "192.168.50.2")
 ROOM_AP_LOCAL_IP = os.getenv("ROOM_AP_LOCAL_IP", "192.168.1.1")
+OPENWRT_WAN_INTERFACE = os.getenv("OPENWRT_WAN_INTERFACE", "wan")
 
 STATE: dict[str, Any] = {
     "ok": False,
@@ -34,7 +35,7 @@ STATE: dict[str, Any] = {
     "instance": {"site": {}, "networks": {}, "wifi": {}, "devices": [], "services": []},
     "home_services": [],
     "ports": [],
-    "wifi_recovery": {"ok": False, "checks": []},
+    "foundation_checks": {"ok": False, "checks": []},
     "console": {"severity": "unknown", "headline": "Waiting for data", "layers": [], "entries": [], "unmanaged_ports": []},
 }
 
@@ -318,6 +319,21 @@ def expected_wifi(metadata: dict[str, Any], key: str) -> str:
     return str((item or {}).get("ssid") or "")
 
 
+def expected_wifi_items(metadata: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+    wifi = metadata.get("wifi") or {}
+    if not isinstance(wifi, dict):
+        return []
+    rows = []
+    for key, item in wifi.items():
+        if not isinstance(item, dict):
+            continue
+        ssid = str(item.get("ssid") or "")
+        band = str(item.get("band") or "")
+        purpose = str(item.get("purpose") or "")
+        rows.append((str(key), ssid, band, purpose))
+    return rows
+
+
 def router_ssh_args(remote_command: str) -> list[str]:
     return [
         "ssh",
@@ -355,16 +371,64 @@ def uci_has_enabled_ssid(wireless_text: str, ssid: str) -> bool:
     return False
 
 
-async def probe_wifi_recovery(metadata: dict[str, Any]) -> dict[str, Any]:
-    main_ssid = expected_wifi(metadata, "main")
-    relay_ssid = expected_wifi(metadata, "relay_5g")
-    ops_ssid = expected_wifi(metadata, "ops")
+def parse_radio_check(radio_text: str, radio_id: str, title: str, action: str) -> dict[str, Any]:
+    try:
+        parsed_radio = json.loads(radio_text)
+        radio = parsed_radio.get(radio_id, parsed_radio) if isinstance(parsed_radio, dict) else {}
+        radio_up = bool(radio.get("up")) and not bool(radio.get("disabled")) and not bool((radio.get("config") or {}).get("disabled")) and not bool(radio.get("retry_setup_failed"))
+        interfaces = radio.get("interfaces") if isinstance(radio, dict) else []
+        active_ssids = []
+        for iface in interfaces if isinstance(interfaces, list) else []:
+            config = iface.get("config") or {}
+            ssid = config.get("ssid")
+            if ssid and not config.get("disabled"):
+                active_ssids.append(str(ssid))
+        detail = f"{radio_id} up={radio.get('up')} disabled={radio.get('disabled') or (radio.get('config') or {}).get('disabled')} ssids={len(active_ssids)}"
+        return check(radio_id, title, "ok" if radio_up else "bad", detail, action)
+    except Exception:
+        return check(radio_id, title, "warn", f"wifi status {radio_id} 返回无法解析。", "进入 OpenWrt 查看无线页面和系统日志。")
+
+
+def parse_wan_check(wan_text: str) -> dict[str, Any]:
+    try:
+        wan = json.loads(wan_text)
+        up = bool(wan.get("up"))
+        pending = bool(wan.get("pending"))
+        available = wan.get("available")
+        l3_device = wan.get("l3_device") or wan.get("device") or ""
+        ipv4 = wan.get("ipv4-address") or []
+        ipv6 = wan.get("ipv6-address") or []
+        has_addr = bool(ipv4 or ipv6)
+        status = "ok" if up and has_addr else ("warn" if up or pending or available else "bad")
+        detail = f"{OPENWRT_WAN_INTERFACE} up={up} addr4={len(ipv4)} addr6={len(ipv6)} dev={l3_device or 'none'}"
+        return check("wan-link", "WAN / 拨号", status, detail, "WAN 异常时先看 OpenWrt 接口、PPPoE 和光猫。")
+    except Exception:
+        return check("wan-link", "WAN / 拨号", "warn", f"ifstatus {OPENWRT_WAN_INTERFACE} 返回无法解析。", "进入 OpenWrt 查看接口状态。")
+
+
+def parse_dnsmasq_check(text: str) -> dict[str, Any]:
+    normalized = text.lower()
+    enabled = "enabled" in normalized
+    running = "running" in normalized
+    status = "ok" if enabled and running else ("warn" if enabled else "bad")
+    detail = "dnsmasq enabled/running" if status == "ok" else f"dnsmasq {'enabled' if enabled else 'disabled'} / {'running' if running else 'not running'}"
+    return check("router-dhcp", "DHCP / 路由 DNS", status, detail, "如果设备拿不到 IP 或显示无网络，先看 dnsmasq。")
+
+
+async def probe_foundation_checks(metadata: dict[str, Any]) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     command = (
+        "echo __WAN__; "
+        f"ifstatus {OPENWRT_WAN_INTERFACE} 2>/dev/null || ubus call network.interface.{OPENWRT_WAN_INTERFACE} status 2>/dev/null || true; "
+        "echo __RADIO0__; "
+        "wifi status radio0 2>/dev/null; "
         "echo __RADIO1__; "
         "wifi status radio1 2>/dev/null; "
         "echo __WIRELESS__; "
         "uci show wireless 2>/dev/null | grep -E \"\\.ssid=|\\.network=|\\.disabled=|\\.mode=|\\.device=\"; "
+        "echo __DNSMASQ__; "
+        "(/etc/init.d/dnsmasq enabled >/dev/null 2>&1 && echo enabled || echo disabled); "
+        "/etc/init.d/dnsmasq status 2>/dev/null || true; "
         "echo __ROOM__; "
         f"ping -c 1 -W 1 {ROOM_AP_IP} >/dev/null 2>&1 && echo up || echo down"
     )
@@ -376,35 +440,44 @@ async def probe_wifi_recovery(metadata: dict[str, Any]) -> dict[str, Any]:
             "ok": False,
             "updated_at": time.time(),
             "checks": [
-                check("router-probe", "主路由无线探测", "warn", detail, "如果刚断电恢复，先确认 OpenWrt SSH 是否可达。"),
+                check("router-probe", "主路由基础探测", "warn", detail, "先确认 OpenWrt SSH 是否可达。"),
                 check("room-ap", "卧室 WRT", "unknown", f"未能通过主路由 ping {ROOM_AP_IP}。", "主路由探测恢复后再看卧室 WRT。", f"http://{ROOM_AP_IP}/"),
             ],
             "room_side_entry": f"http://{ROOM_AP_LOCAL_IP}/",
         }
 
+    wan_text = extract_block(text, "__WAN__", "__RADIO0__")
+    radio0_text = extract_block(text, "__RADIO0__", "__RADIO1__")
     radio_text = extract_block(text, "__RADIO1__", "__WIRELESS__")
-    wireless_text = extract_block(text, "__WIRELESS__", "__ROOM__")
+    wireless_text = extract_block(text, "__WIRELESS__", "__DNSMASQ__")
+    dnsmasq_text = extract_block(text, "__DNSMASQ__", "__ROOM__")
     room_text = extract_block(text, "__ROOM__")
 
-    try:
-        parsed_radio = json.loads(radio_text)
-        radio = parsed_radio.get("radio1", parsed_radio) if isinstance(parsed_radio, dict) else {}
-        radio_up = bool(radio.get("up")) and not bool((radio.get("config") or {}).get("disabled")) and not bool(radio.get("retry_setup_failed"))
-        radio_detail = f"radio1 up={radio.get('up')} disabled={(radio.get('config') or {}).get('disabled')} retry_failed={radio.get('retry_setup_failed')}"
-        checks.append(check("radio-5g", "主路由 5G radio", "ok" if radio_up else "bad", radio_detail, "断电后来 5G 不起时，先重启无线或查看 OpenWrt wireless 日志。"))
-    except Exception:
-        checks.append(check("radio-5g", "主路由 5G radio", "warn", "wifi status radio1 返回无法解析。", "进入 OpenWrt 查看无线页面和系统日志。"))
+    checks.append(parse_wan_check(wan_text))
+    checks.append(parse_dnsmasq_check(dnsmasq_text))
+    checks.append(parse_radio_check(radio0_text, "radio0", "主路由 2.4G radio", "IoT、Ops 或部分设备异常时，先看 2.4G radio。"))
+    checks.append(parse_radio_check(radio_text, "radio1", "主路由 5G radio", "5G 异常时，先重启无线或查看 OpenWrt wireless 日志。"))
 
-    wifi_expectations = [
-        ("main-ssid", "主 Wi-Fi", main_ssid, "主 SSID 没广播会导致日常设备断网。"),
-        ("backhaul-ssid", "卧室回程", relay_ssid, "回程 SSID 没广播会导致卧室 WRT 掉线。"),
-        ("ops-wifi", "检修 Wi-Fi", ops_ssid, "检修 Wi-Fi 没广播会影响故障时用设备进 Pi。"),
-    ]
-    for check_id, title, ssid, action in wifi_expectations:
+    for wifi_key, ssid, band, purpose in expected_wifi_items(metadata):
+        title = {
+            "main": "主 Wi-Fi",
+            "relay_5g": "卧室回程",
+            "ops": "检修 Wi-Fi",
+            "iot": "IoT Wi-Fi",
+            "guest": "访客 Wi-Fi",
+        }.get(wifi_key, f"Wi-Fi {wifi_key}")
+        action = {
+            "main": "主 SSID 没广播会导致日常设备断网。",
+            "relay_5g": "回程 SSID 没广播会导致卧室 WRT 掉线。",
+            "ops": "检修 Wi-Fi 没广播会影响故障时用设备进 Pi。",
+            "iot": "IoT Wi-Fi 没广播会影响智能家居和摄像头。",
+            "guest": "访客 Wi-Fi 没广播只影响访客网络。",
+        }.get(wifi_key, purpose or "检查 OpenWrt wireless。")
+        check_id = f"wifi-{wifi_key}"
         if not ssid:
             checks.append(check(check_id, title, "unknown", "实例未声明 SSID。", "检查 instance wifi 定义。"))
         elif uci_has_enabled_ssid(wireless_text, ssid):
-            checks.append(check(check_id, title, "ok", f"{ssid} 已在 OpenWrt wireless 中启用。"))
+            checks.append(check(check_id, title, "ok", f"{ssid} 已启用 · {band or 'band unknown'}"))
         else:
             checks.append(check(check_id, title, "bad", f"{ssid} 未在 OpenWrt wireless 中启用或未找到。", action))
 
@@ -419,25 +492,28 @@ async def probe_wifi_recovery(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], ports: list[dict[str, Any]], wifi_recovery: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], ports: list[dict[str, Any]], foundation_checks: dict[str, Any] | None = None) -> dict[str, Any]:
     gateway = worst([service_status(services, "openwrt-luci"), service_status(services, "openwrt-ssh")])
-    wifi_recovery = wifi_recovery or {"checks": []}
-    wifi_checks = list(wifi_recovery.get("checks") or [])
-    wifi_by_id = {item.get("id"): item for item in wifi_checks}
-    wifi_status = worst([str((wifi_by_id.get(key) or {}).get("status") or "unknown") for key in ["radio-5g", "main-ssid", "backhaul-ssid", "ops-wifi"]])
-    wifi_problem = first_problem([wifi_by_id.get(key) for key in ["radio-5g", "main-ssid", "backhaul-ssid", "ops-wifi"] if wifi_by_id.get(key)] or [])
-    room_probe = str((wifi_by_id.get("room-ap") or {}).get("status") or "unknown")
+    foundation_checks = foundation_checks or {"checks": []}
+    foundation_items = list(foundation_checks.get("checks") or [])
+    foundation_by_id = {item.get("id"): item for item in foundation_items}
+    wifi_keys = ["radio0", "radio1", "wifi-main", "wifi-relay_5g", "wifi-iot", "wifi-guest", "wifi-ops"]
+    wifi_status = worst([str((foundation_by_id.get(key) or {}).get("status") or "unknown") for key in wifi_keys])
+    wifi_problem = first_problem([foundation_by_id.get(key) for key in wifi_keys if foundation_by_id.get(key)] or [])
+    room_probe = str((foundation_by_id.get("room-ap") or {}).get("status") or "unknown")
     room = worst([service_status(services, "wrt-room-luci"), service_status(services, "wrt-room-ssh"), room_probe])
     dns_proxy = worst([service_status(services, "adguard"), service_status(services, "mihomo")])
     runtime = worst([service_status(services, key) for key in ["homenet-ops", "adguard", "mihomo", "home-assistant", "uptime-kuma", "cloudflared", "wireguard"]])
     remote = worst([service_status(services, key) for key in ["cloudflared", "wireguard", "caddy", "ddns-go"]])
-    rescue = worst([service_status(services, "homenet-ops"), service_status(services, "pi-ssh"), str((wifi_by_id.get("ops-wifi") or {}).get("status") or "unknown")])
-    room_detail = str((wifi_by_id.get("room-ap") or {}).get("detail") or "卧室覆盖由 WRT Room 承担。")
+    rescue = worst([service_status(services, "homenet-ops"), service_status(services, "pi-ssh"), str((foundation_by_id.get("wifi-ops") or {}).get("status") or "unknown")])
+    wan_probe = str((foundation_by_id.get("wan-link") or {}).get("status") or "unknown")
+    gateway = worst([gateway, wan_probe, str((foundation_by_id.get("router-dhcp") or {}).get("status") or "unknown")])
+    room_detail = str((foundation_by_id.get("room-ap") or {}).get("detail") or "卧室覆盖由 WRT Room 承担。")
 
     layers = [
         layer("rescue-path", "检修通道", "ok" if rescue == "ok" else "warn", "Ops Wi-Fi、Console、Pi SSH 组成检修入口。", "主网络复杂路径坏了，连检修 Wi-Fi 后从这里进 Pi。"),
         layer("gateway-wan", "主路由 / WAN", gateway, "OpenWrt LuCI/SSH 是基础入口。", "如果这里异常，先查 OpenWrt WAN、DHCP、接口和防火墙。"),
-        layer("main-wifi-5g", "主 Wi-Fi / 5G", wifi_status, str((wifi_problem or {}).get("detail") or "主路由 5G radio、主 SSID、回程 SSID 已检查。"), "断电后来电 5G 不起时，只看 OpenWrt wireless/radio，不改 DNS/Proxy。"),
+        layer("main-wifi-5g", "Wi-Fi / Radio", wifi_status, str((wifi_problem or {}).get("detail") or "2.4G、5G 和声明的 SSID 已检查。"), "Wi-Fi 异常时先看 OpenWrt wireless/radio，不改 DNS/Proxy。"),
         layer("room-ap", "卧室 WRT", room, room_detail, "卧室慢时先查 WRT Room 回程和管理入口，不做全网重构。", f"http://{ROOM_AP_IP}/"),
         layer("dns-proxy", "DNS / Proxy", dns_proxy, "AdGuard 负责 DNS，Mihomo 负责代理和分流。", "国内慢看 DIRECT/DNS，国外慢看 Mihomo 节点组和规则。"),
         layer("server-runtime", "Pi 服务", runtime, "Pi 承载 DNS、Proxy、HA、Kuma、WireGuard、Console 等服务。", "多个服务一起异常时先查 Docker/systemd/端口。"),
@@ -473,8 +549,8 @@ def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], port
         "active_problem": active,
         "layers": layers,
         "entries": entries,
-        "power_recovery": wifi_checks,
-        "room_side_entry": wifi_recovery.get("room_side_entry") or f"http://{ROOM_AP_LOCAL_IP}/",
+        "foundation_checks": foundation_items,
+        "room_side_entry": foundation_checks.get("room_side_entry") or f"http://{ROOM_AP_LOCAL_IP}/",
         "unmanaged_ports": unmanaged[:16],
         "unmanaged_port_count": len(unmanaged),
         "current_error_count": len(STATE.get("errors") or []),
@@ -488,15 +564,15 @@ async def refresh_state() -> None:
     try:
         metadata = await load_metadata()
         services, ports = await probe_services(metadata)
-        wifi_recovery = await probe_wifi_recovery(metadata)
+        foundation_checks = await probe_foundation_checks(metadata)
         STATE.update({
             "ok": True,
             "metadata": {"schema": metadata.get("schema"), "profile": metadata.get("profile")},
             "instance": instance_from_metadata(metadata),
             "home_services": services,
             "ports": [{k: v for k, v in port.items() if k != "service_key"} for port in ports],
-            "wifi_recovery": wifi_recovery,
-            "console": build_console(metadata, services, ports, wifi_recovery),
+            "foundation_checks": foundation_checks,
+            "console": build_console(metadata, services, ports, foundation_checks),
             "updated_at": time.time(),
         })
     except Exception as exc:
