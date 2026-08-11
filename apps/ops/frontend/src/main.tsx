@@ -8,6 +8,7 @@ import {
   Globe2,
   Home,
   Layers3,
+  Laptop,
   RadioTower,
   RefreshCw,
   Save,
@@ -20,7 +21,7 @@ import {
 import "./styles.css";
 
 type Status = "ok" | "warn" | "bad" | "down" | "tracked" | "unknown" | string;
-type View = "home" | "topology" | "routing" | "services";
+type View = "home" | "topology" | "devices" | "routing" | "services";
 
 type ConsoleLayer = {
   id?: string;
@@ -104,6 +105,26 @@ type RoutingState = {
   error?: string;
 };
 
+type Device = {
+  id?: string;
+  name?: string;
+  role?: string;
+  network?: string;
+  ip?: string;
+  expected?: boolean;
+  presence?: string;
+  expected_macs?: string[];
+  current_mac?: string;
+  lease_mac?: string;
+  neighbor_mac?: string;
+  hostname?: string;
+  neighbor_state?: string;
+  status?: Status;
+  detail?: string;
+  evidence?: string[];
+  via_room_relay?: boolean;
+};
+
 type State = {
   ok?: boolean;
   updated_at?: number;
@@ -113,6 +134,7 @@ type State = {
   mihomo?: { down_mbps?: number; up_mbps?: number };
   home_services?: Service[];
   ports?: Port[];
+  devices?: { ok?: boolean; summary?: { total?: number; online?: number; attention?: number; standby?: number }; items?: Device[] };
   console?: ConsoleSummary;
   foundation_checks?: { ok?: boolean; checks?: ConsoleLayer[]; room_side_entry?: string };
   instance?: {
@@ -127,6 +149,7 @@ type State = {
 const emptyState: State = {
   home_services: [],
   ports: [],
+  devices: { summary: {}, items: [] },
   console: { layers: [], entries: [], unmanaged_ports: [] },
   instance: { networks: {}, wifi: {} },
   remote_access: { clients: [] },
@@ -136,6 +159,7 @@ const emptyState: State = {
 const tabs: Array<{ id: View; label: string; icon: React.ReactNode }> = [
   { id: "home", label: "首页", icon: <Compass size={16} /> },
   { id: "topology", label: "拓扑", icon: <RadioTower size={16} /> },
+  { id: "devices", label: "设备", icon: <Laptop size={16} /> },
   { id: "routing", label: "分流", icon: <Globe2 size={16} /> },
   { id: "services", label: "服务", icon: <Layers3 size={16} /> }
 ];
@@ -178,8 +202,9 @@ const groupDescriptions: Record<string, string> = {
 function cls(status?: Status) {
   if (status === "ok") return "ok";
   if (status === "warn") return "warn";
-  if (status === "bad" || status === "down") return "bad";
+  if (status === "bad" || status === "down" || status === "offline") return "bad";
   if (status === "tracked") return "tracked";
+  if (status === "sleeping") return "tracked";
   return "unknown";
 }
 
@@ -196,6 +221,8 @@ function label(status?: Status) {
   if (c === "ok") return "正常";
   if (c === "bad") return "异常";
   if (c === "warn") return "注意";
+  if (status === "offline") return "离线";
+  if (status === "sleeping") return "可离线";
   if (c === "tracked") return "已记录";
   return "等待";
 }
@@ -329,6 +356,7 @@ function App() {
 
       {view === "home" && <HomeView state={state} />}
       {view === "topology" && <TopologyView state={state} />}
+      {view === "devices" && <DevicesView state={state} query={query} setQuery={setQuery} />}
       {view === "routing" && <RoutingView />}
       {view === "services" && <ServicesView state={state} query={query} setQuery={setQuery} />}
     </main>
@@ -437,6 +465,34 @@ function TopologyView({ state }: { state: State }) {
         </div>
         {state.console?.room_side_entry && <p className="note">连在卧室 WRT 下方时，房间侧管理入口：{state.console.room_side_entry}</p>}
       </Panel>
+    </section>
+  );
+}
+
+function DevicesView({ state, query, setQuery }: { state: State; query: string; setQuery: (value: string) => void }) {
+  const devices = state.devices?.items || [];
+  const summary = state.devices?.summary || {};
+  const visible = query.trim()
+    ? devices.filter((device) => `${device.ip} ${device.name} ${device.id} ${device.role} ${device.current_mac} ${(device.expected_macs || []).join(" ")}`.toLowerCase().includes(query.trim().toLowerCase()))
+    : devices;
+
+  return (
+    <section className="pageStack">
+      <PageHeader title="设备" text="按 IP 查看设备是谁、当前是否在线，以及当前二层证据来自 DHCP、neighbor 还是 WRT Room 中继。" />
+      <div className="summaryStrip">
+        <span><b>{summary.total ?? devices.length}</b> 总数</span>
+        <span><b>{summary.online ?? 0}</b> 在线</span>
+        <span><b>{summary.standby ?? 0}</b> 可离线</span>
+        <span><b>{summary.attention ?? 0}</b> 注意</span>
+      </div>
+      <label className="search">
+        <Search size={16} />
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 IP、设备、MAC" />
+      </label>
+      <div className="deviceList">
+        {visible.map((device) => <DeviceRow key={device.id || device.ip} device={device} />)}
+        {!visible.length && <EmptyLine text="没有匹配的设备。" />}
+      </div>
     </section>
   );
 }
@@ -637,6 +693,28 @@ function ServiceCard({ service }: { service: Service }) {
       </div>
       {!!service.ports?.length && <div className="chipRow">{service.ports.map((port, index) => <span key={`${service.key}-${index}`}>{port.port}/{port.proto} · {portScope(port.scope)}</span>)}</div>}
       {!!links(service).length && <div className="actions inline">{links(service).map((link) => <a href={link.href} target="_blank" rel="noreferrer" key={link.label}>{link.label}<ArrowUpRight size={13} /></a>)}</div>}
+    </article>
+  );
+}
+
+function DeviceRow({ device }: { device: Device }) {
+  return (
+    <article className={`deviceRow ${cls(device.status)}`}>
+      <div className="deviceMain">
+        {icon(device.status)}
+        <span>
+          <b>{device.ip}</b>
+          <p>{device.name || device.id} · {device.role || device.network || "device"}</p>
+        </span>
+        <strong>{label(device.status)}</strong>
+      </div>
+      <div className="deviceMeta">
+        <span>{device.detail || "等待证据"}</span>
+        {device.hostname && <span>host: {device.hostname}</span>}
+        {device.current_mac && <span>current: {device.current_mac}</span>}
+        {!!device.expected_macs?.length && <span>expected: {device.expected_macs.join(", ")}</span>}
+        {!!device.evidence?.length && <span>{device.evidence.join(" / ")}</span>}
+      </div>
     </article>
   );
 }

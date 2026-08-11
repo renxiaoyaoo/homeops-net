@@ -141,7 +141,7 @@ p {
 
 .tabs {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 6px;
   width: min(560px, 100%);
   border: 1px solid rgba(32, 32, 29, 0.09);
@@ -450,6 +450,7 @@ p {
 
 .miniGrid,
 .recoveryGrid,
+.deviceList,
 .serviceGrid {
   display: grid;
   gap: 9px;
@@ -509,6 +510,94 @@ p {
 
 .search input {
   padding-left: 34px;
+}
+
+.summaryStrip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.summaryStrip span {
+  display: grid;
+  gap: 3px;
+  border: 1px solid rgba(32, 32, 29, 0.08);
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 10px;
+  color: #686862;
+  font-size: 12px;
+}
+
+.summaryStrip b {
+  color: #20201d;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.deviceRow {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(32, 32, 29, 0.08);
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 12px;
+}
+
+.deviceRow.warn {
+  border-color: rgba(167, 106, 32, 0.24);
+  background: #fffaf0;
+}
+
+.deviceRow.bad {
+  border-color: rgba(180, 73, 62, 0.26);
+  background: #fff6f4;
+}
+
+.deviceMain {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: start;
+}
+
+.deviceMain b,
+.deviceMain p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deviceMain b {
+  color: #20201d;
+  font-size: 14px;
+}
+
+.deviceMain p,
+.deviceMain strong,
+.deviceMeta {
+  color: #686862;
+  font-size: 12px;
+}
+
+.deviceMain strong {
+  font-weight: 780;
+}
+
+.deviceMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-left: 31px;
+}
+
+.deviceMeta span {
+  min-height: 23px;
+  border: 1px solid rgba(32, 32, 29, 0.08);
+  border-radius: 6px;
+  background: #f6f6f2;
+  padding: 3px 7px;
+  overflow-wrap: anywhere;
 }
 
 .serviceGroup {
@@ -627,6 +716,7 @@ p {
   .homeGrid,
   .topologyGrid,
   .recoveryGrid,
+  .summaryStrip,
   .twoCols,
   .routingForm {
     grid-template-columns: 1fr;
@@ -650,6 +740,7 @@ p {
   .entry,
   .layerFocus,
   .domainCard header,
+  .deviceMain,
   .serviceCard header {
     grid-template-columns: 22px minmax(0, 1fr);
   }
@@ -657,8 +748,13 @@ p {
   .entry div,
   .layerFocus strong,
   .domainCard header b,
+  .deviceMain strong,
   .serviceCard header span {
     grid-column: 2;
     justify-content: flex-start;
+  }
+
+  .deviceMeta {
+    padding-left: 31px;
   }
 }

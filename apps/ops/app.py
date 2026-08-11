@@ -35,6 +35,7 @@ STATE: dict[str, Any] = {
     "instance": {"site": {}, "networks": {}, "wifi": {}, "devices": [], "services": []},
     "home_services": [],
     "ports": [],
+    "devices": [],
     "foundation_checks": {"ok": False, "checks": []},
     "console": {"severity": "unknown", "headline": "Waiting for data", "layers": [], "entries": [], "unmanaged_ports": []},
 }
@@ -96,6 +97,21 @@ def instance_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "wifi": metadata.get("wifi") or {},
         "devices": metadata.get("devices") or [],
         "services": metadata.get("service_directory") or [],
+    }
+
+
+def instance_device_details() -> dict[str, dict[str, Any]]:
+    try:
+        doc = yaml.safe_load((INSTANCE_DIR / "devices.yaml").read_text(encoding="utf-8")) or {}
+    except OSError:
+        return {}
+    devices = doc.get("devices") if isinstance(doc, dict) else []
+    if not isinstance(devices, list):
+        return {}
+    return {
+        str(device.get("id")): device
+        for device in devices
+        if isinstance(device, dict) and device.get("id")
     }
 
 
@@ -428,6 +444,187 @@ def parse_dnsmasq_check(text: str) -> dict[str, Any]:
     return check("router-dhcp", "DHCP / 路由 DNS", status, detail, "如果设备拿不到 IP 或显示无网络，先看 dnsmasq。")
 
 
+def normalize_mac(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def parse_dhcp_leases(text: str) -> dict[str, dict[str, Any]]:
+    leases: dict[str, dict[str, Any]] = {}
+    now = int(time.time())
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            expires_at = int(parts[0])
+        except ValueError:
+            expires_at = 0
+        mac, ip, hostname = normalize_mac(parts[1]), parts[2], parts[3]
+        leases[ip] = {
+            "ip": ip,
+            "mac": mac,
+            "hostname": "" if hostname == "*" else hostname,
+            "expires_at": expires_at,
+            "active": expires_at == 0 or expires_at > now,
+        }
+    return leases
+
+
+def parse_neighbors(text: str) -> dict[str, dict[str, Any]]:
+    neighbors: dict[str, dict[str, Any]] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        ip = parts[0]
+        mac = ""
+        if "lladdr" in parts:
+            index = parts.index("lladdr")
+            if index + 1 < len(parts):
+                mac = normalize_mac(parts[index + 1])
+        state = parts[-1] if parts[-1].isupper() else ""
+        if mac:
+            neighbors[ip] = {"ip": ip, "mac": mac, "state": state}
+    return neighbors
+
+
+def ip_sort_key(value: str) -> tuple[int, int, int, int]:
+    try:
+        return tuple(int(part) for part in value.split("."))  # type: ignore[return-value]
+    except Exception:
+        return (999, 999, 999, 999)
+
+
+async def probe_devices(metadata: dict[str, Any]) -> dict[str, Any]:
+    details = instance_device_details()
+    devices = []
+    for item in metadata.get("devices") or []:
+        if not isinstance(item, dict):
+            continue
+        device_id = str(item.get("id") or "")
+        devices.append({**item, **(details.get(device_id) or {})})
+    for device_id, detail in details.items():
+        if not any(str(item.get("id") or "") == device_id for item in devices):
+            devices.append(detail)
+    room_macs = {
+        normalize_mac(mac)
+        for device in devices
+        if device.get("id") == "wrt-room"
+        for mac in device.get("macs") or []
+    }
+    command = "echo __LEASES__; cat /tmp/dhcp.leases 2>/dev/null; echo __NEIGH__; ip neigh show 2>/dev/null"
+    try:
+        text = await run_text_command(router_ssh_args(command), timeout=8)
+        leases = parse_dhcp_leases(extract_block(text, "__LEASES__", "__NEIGH__"))
+        neighbors = parse_neighbors(extract_block(text, "__NEIGH__"))
+        probe_ok = True
+    except Exception as exc:
+        add_error(f"device probe failed: {type(exc).__name__}: {exc}")
+        leases, neighbors, probe_ok = {}, {}, False
+
+    rows = []
+    seen_ips: set[str] = set()
+    for device in devices:
+        ip = str(device.get("ip") or "")
+        if not ip:
+            continue
+        seen_ips.add(ip)
+        expected_macs = {normalize_mac(mac) for mac in device.get("macs") or []}
+        lease = leases.get(ip) or {}
+        neighbor = neighbors.get(ip) or {}
+        lease_mac = normalize_mac(str(lease.get("mac") or ""))
+        neighbor_mac = normalize_mac(str(neighbor.get("mac") or ""))
+        current_mac = neighbor_mac or lease_mac
+        lease_matches = bool(lease_mac and (not expected_macs or lease_mac in expected_macs))
+        neighbor_matches = bool(neighbor_mac and (not expected_macs or neighbor_mac in expected_macs))
+        via_room = bool(neighbor_mac and neighbor_mac in room_macs and lease_matches and device.get("id") != "wrt-room")
+        evidence = []
+        if lease:
+            evidence.append("DHCP")
+        if neighbor:
+            evidence.append(f"neighbor {neighbor.get('state') or 'seen'}")
+        presence = str(device.get("presence") or "")
+        expected = bool(device.get("expected", True))
+        if not probe_ok:
+            status, detail = "unknown", "无法读取主路由 DHCP/neighbor 证据。"
+        elif via_room:
+            status = "ok"
+            detail = "在线，经 WRT Room 中继/proxy ARP"
+        elif neighbor_matches or lease_matches:
+            status = "ok"
+            detail = "在线"
+        elif current_mac and expected_macs and current_mac not in expected_macs:
+            status = "warn"
+            detail = "IP 当前 MAC 与声明不一致"
+        elif lease or neighbor:
+            status = "ok"
+            detail = "在线，未声明 MAC"
+        elif not expected:
+            status = "tracked"
+            detail = "保留设备，当前未在线"
+        elif presence in {"optional", "intermittent"}:
+            status = "sleeping"
+            detail = "可离线/间歇在线"
+        else:
+            status = "offline"
+            detail = "未在线"
+        rows.append({
+            "id": device.get("id"),
+            "name": device.get("name") or device.get("id"),
+            "role": device.get("role") or "",
+            "network": device.get("network") or "",
+            "ip": ip,
+            "expected": expected,
+            "presence": presence,
+            "expected_macs": sorted(expected_macs),
+            "current_mac": current_mac,
+            "lease_mac": lease_mac,
+            "neighbor_mac": neighbor_mac,
+            "hostname": lease.get("hostname") or (device.get("hostnames") or [""])[0],
+            "neighbor_state": neighbor.get("state") or "",
+            "status": status,
+            "detail": detail,
+            "evidence": evidence,
+            "via_room_relay": via_room,
+        })
+
+    for ip, lease in leases.items():
+        if ip in seen_ips:
+            continue
+        neighbor = neighbors.get(ip) or {}
+        rows.append({
+            "id": f"unknown-{ip}",
+            "name": lease.get("hostname") or "未知设备",
+            "role": "DHCP lease",
+            "network": "",
+            "ip": ip,
+            "expected": False,
+            "presence": "",
+            "expected_macs": [],
+            "current_mac": neighbor.get("mac") or lease.get("mac") or "",
+            "lease_mac": lease.get("mac") or "",
+            "neighbor_mac": neighbor.get("mac") or "",
+            "hostname": lease.get("hostname") or "",
+            "neighbor_state": neighbor.get("state") or "",
+            "status": "warn",
+            "detail": "DHCP 中存在但 instance 未声明",
+            "evidence": ["DHCP"] + ([f"neighbor {neighbor.get('state')}"] if neighbor else []),
+            "via_room_relay": False,
+        })
+
+    return {
+        "ok": probe_ok,
+        "updated_at": time.time(),
+        "summary": {
+            "total": len(rows),
+            "online": sum(1 for row in rows if row["status"] == "ok"),
+            "attention": sum(1 for row in rows if row["status"] in {"warn", "offline"}),
+            "standby": sum(1 for row in rows if row["status"] in {"sleeping", "tracked"}),
+        },
+        "items": sorted(rows, key=lambda row: ip_sort_key(str(row.get("ip") or ""))),
+    }
+
+
 async def probe_foundation_checks(metadata: dict[str, Any]) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     command = (
@@ -578,12 +775,14 @@ async def refresh_state() -> None:
         metadata = await load_metadata()
         services, ports = await probe_services(metadata)
         foundation_checks = await probe_foundation_checks(metadata)
+        devices = await probe_devices(metadata)
         STATE.update({
             "ok": True,
             "metadata": {"schema": metadata.get("schema"), "profile": metadata.get("profile")},
             "instance": instance_from_metadata(metadata),
             "home_services": services,
             "ports": [{k: v for k, v in port.items() if k != "service_key"} for port in ports],
+            "devices": devices,
             "foundation_checks": foundation_checks,
             "console": build_console(metadata, services, ports, foundation_checks),
             "updated_at": time.time(),
