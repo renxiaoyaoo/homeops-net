@@ -21,6 +21,10 @@ ROUTING_RULES_STORE = Path(os.getenv("ROUTING_RULES_STORE", "/runtime/routing/ru
 ROUTING_RULE_DIR = Path(os.getenv("ROUTING_RULE_DIR", "/mihomo-rules")).resolve()
 REFRESH = float(os.getenv("REFRESH", "15"))
 PORT = int(os.getenv("PORT", "9999"))
+OPENWRT_HOST = os.getenv("OPENWRT_HOST", "192.168.50.1")
+OPENWRT_USER = os.getenv("OPENWRT_USER", "root")
+ROOM_AP_IP = os.getenv("ROOM_AP_IP", "192.168.50.2")
+ROOM_AP_LOCAL_IP = os.getenv("ROOM_AP_LOCAL_IP", "192.168.1.1")
 
 STATE: dict[str, Any] = {
     "ok": False,
@@ -30,6 +34,7 @@ STATE: dict[str, Any] = {
     "instance": {"site": {}, "networks": {}, "wifi": {}, "devices": [], "services": []},
     "home_services": [],
     "ports": [],
+    "wifi_recovery": {"ok": False, "checks": []},
     "console": {"severity": "unknown", "headline": "Waiting for data", "layers": [], "entries": [], "unmanaged_ports": []},
 }
 
@@ -63,6 +68,20 @@ async def run_json_command(args: list[str], timeout: float = 12) -> dict[str, An
         detail = (err or out).decode(errors="replace").strip()[:240]
         raise RuntimeError(detail or f"exit {proc.returncode}")
     return json.loads(out.decode())
+
+
+async def run_text_command(args: list[str], timeout: float = 8) -> str:
+    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError("timeout")
+    if proc.returncode != 0:
+        detail = (err or out).decode(errors="replace").strip()[:240]
+        raise RuntimeError(detail or f"exit {proc.returncode}")
+    return out.decode(errors="replace")
 
 
 async def load_metadata() -> dict[str, Any]:
@@ -285,18 +304,141 @@ def layer(layer_id: str, title: str, status: str, detail: str, next_action: str,
     return {"id": layer_id, "title": title, "status": status, "detail": detail, "next_action": next_action, "entry": entry}
 
 
-def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], ports: list[dict[str, Any]]) -> dict[str, Any]:
+def check(check_id: str, title: str, status: str, detail: str, next_action: str = "", entry: str = "") -> dict[str, Any]:
+    return {"id": check_id, "title": title, "status": status, "detail": detail, "next_action": next_action, "entry": entry}
+
+
+def first_problem(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next((item for item in sorted(items, key=lambda item: severity(str(item.get("status") or "unknown")), reverse=True) if item.get("status") in {"bad", "down", "warn", "unknown"}), None)
+
+
+def expected_wifi(metadata: dict[str, Any], key: str) -> str:
+    wifi = metadata.get("wifi") or {}
+    item = wifi.get(key) if isinstance(wifi, dict) else {}
+    return str((item or {}).get("ssid") or "")
+
+
+def router_ssh_args(remote_command: str) -> list[str]:
+    return [
+        "ssh",
+        "-F",
+        "none",
+        "-i",
+        "/root/.ssh/id_ed25519",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=3",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        f"{OPENWRT_USER}@{OPENWRT_HOST}",
+        remote_command,
+    ]
+
+
+def extract_block(text: str, start: str, end: str | None = None) -> str:
+    if start not in text:
+        return ""
+    value = text.split(start, 1)[1]
+    if end and end in value:
+        value = value.split(end, 1)[0]
+    return value.strip()
+
+
+def uci_has_enabled_ssid(wireless_text: str, ssid: str) -> bool:
+    if not ssid or ssid not in wireless_text:
+        return False
+    sections = wireless_text.split("\nwireless.")
+    for section in sections:
+        if f".ssid='{ssid}'" in section or f'.ssid="{ssid}"' in section or f".ssid={ssid}" in section:
+            return ".disabled='1'" not in section and '.disabled="1"' not in section and ".disabled=1" not in section
+    return False
+
+
+async def probe_wifi_recovery(metadata: dict[str, Any]) -> dict[str, Any]:
+    main_ssid = expected_wifi(metadata, "main")
+    relay_ssid = expected_wifi(metadata, "relay_5g")
+    ops_ssid = expected_wifi(metadata, "ops")
+    checks: list[dict[str, Any]] = []
+    command = (
+        "echo __RADIO1__; "
+        "wifi status radio1 2>/dev/null; "
+        "echo __WIRELESS__; "
+        "uci show wireless 2>/dev/null | grep -E \"\\.ssid=|\\.network=|\\.disabled=|\\.mode=|\\.device=\"; "
+        "echo __ROOM__; "
+        f"ping -c 1 -W 1 {ROOM_AP_IP} >/dev/null 2>&1 && echo up || echo down"
+    )
+    try:
+        text = await run_text_command(router_ssh_args(command), timeout=8)
+    except Exception as exc:
+        detail = f"主路由 SSH 只读探测失败：{type(exc).__name__}"
+        return {
+            "ok": False,
+            "updated_at": time.time(),
+            "checks": [
+                check("router-probe", "主路由无线探测", "warn", detail, "如果刚断电恢复，先确认 OpenWrt SSH 是否可达。"),
+                check("room-ap", "卧室 WRT", "unknown", f"未能通过主路由 ping {ROOM_AP_IP}。", "主路由探测恢复后再看卧室 WRT。", f"http://{ROOM_AP_IP}/"),
+            ],
+            "room_side_entry": f"http://{ROOM_AP_LOCAL_IP}/",
+        }
+
+    radio_text = extract_block(text, "__RADIO1__", "__WIRELESS__")
+    wireless_text = extract_block(text, "__WIRELESS__", "__ROOM__")
+    room_text = extract_block(text, "__ROOM__")
+
+    try:
+        parsed_radio = json.loads(radio_text)
+        radio = parsed_radio.get("radio1", parsed_radio) if isinstance(parsed_radio, dict) else {}
+        radio_up = bool(radio.get("up")) and not bool((radio.get("config") or {}).get("disabled")) and not bool(radio.get("retry_setup_failed"))
+        radio_detail = f"radio1 up={radio.get('up')} disabled={(radio.get('config') or {}).get('disabled')} retry_failed={radio.get('retry_setup_failed')}"
+        checks.append(check("radio-5g", "主路由 5G radio", "ok" if radio_up else "bad", radio_detail, "断电后来 5G 不起时，先重启无线或查看 OpenWrt wireless 日志。"))
+    except Exception:
+        checks.append(check("radio-5g", "主路由 5G radio", "warn", "wifi status radio1 返回无法解析。", "进入 OpenWrt 查看无线页面和系统日志。"))
+
+    wifi_expectations = [
+        ("main-ssid", "主 Wi-Fi", main_ssid, "主 SSID 没广播会导致日常设备断网。"),
+        ("backhaul-ssid", "卧室回程", relay_ssid, "回程 SSID 没广播会导致卧室 WRT 掉线。"),
+        ("ops-wifi", "检修 Wi-Fi", ops_ssid, "检修 Wi-Fi 没广播会影响故障时用设备进 Pi。"),
+    ]
+    for check_id, title, ssid, action in wifi_expectations:
+        if not ssid:
+            checks.append(check(check_id, title, "unknown", "实例未声明 SSID。", "检查 instance wifi 定义。"))
+        elif uci_has_enabled_ssid(wireless_text, ssid):
+            checks.append(check(check_id, title, "ok", f"{ssid} 已在 OpenWrt wireless 中启用。"))
+        else:
+            checks.append(check(check_id, title, "bad", f"{ssid} 未在 OpenWrt wireless 中启用或未找到。", action))
+
+    room_up = room_text.splitlines()[-1].strip() == "up" if room_text.splitlines() else False
+    checks.append(check("room-ap", "卧室 WRT", "ok" if room_up else "bad", f"{ROOM_AP_IP} {'可达' if room_up else '不可达'}。", "卧室 WRT 不可达时，先看回程 SSID 和设备供电。", f"http://{ROOM_AP_IP}/"))
+
+    return {
+        "ok": not any(item.get("status") in {"bad", "down", "warn"} for item in checks),
+        "updated_at": time.time(),
+        "checks": checks,
+        "room_side_entry": f"http://{ROOM_AP_LOCAL_IP}/",
+    }
+
+
+def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], ports: list[dict[str, Any]], wifi_recovery: dict[str, Any] | None = None) -> dict[str, Any]:
     gateway = worst([service_status(services, "openwrt-luci"), service_status(services, "openwrt-ssh")])
-    room = worst([service_status(services, "wrt-room-luci"), service_status(services, "wrt-room-ssh")])
+    wifi_recovery = wifi_recovery or {"checks": []}
+    wifi_checks = list(wifi_recovery.get("checks") or [])
+    wifi_by_id = {item.get("id"): item for item in wifi_checks}
+    wifi_status = worst([str((wifi_by_id.get(key) or {}).get("status") or "unknown") for key in ["radio-5g", "main-ssid", "backhaul-ssid", "ops-wifi"]])
+    wifi_problem = first_problem([wifi_by_id.get(key) for key in ["radio-5g", "main-ssid", "backhaul-ssid", "ops-wifi"] if wifi_by_id.get(key)] or [])
+    room_probe = str((wifi_by_id.get("room-ap") or {}).get("status") or "unknown")
+    room = worst([service_status(services, "wrt-room-luci"), service_status(services, "wrt-room-ssh"), room_probe])
     dns_proxy = worst([service_status(services, "adguard"), service_status(services, "mihomo")])
     runtime = worst([service_status(services, key) for key in ["homenet-ops", "adguard", "mihomo", "home-assistant", "uptime-kuma", "cloudflared", "wireguard"]])
     remote = worst([service_status(services, key) for key in ["cloudflared", "wireguard", "caddy", "ddns-go"]])
+    rescue = worst([service_status(services, "homenet-ops"), service_status(services, "pi-ssh"), str((wifi_by_id.get("ops-wifi") or {}).get("status") or "unknown")])
+    room_detail = str((wifi_by_id.get("room-ap") or {}).get("detail") or "卧室覆盖由 WRT Room 承担。")
 
     layers = [
-        layer("rescue-path", "检修通道", "ok" if service_status(services, "homenet-ops") == "ok" and service_status(services, "pi-ssh") == "ok" else "warn", "Console 和 Pi SSH 是检修入口。", "主网络复杂路径坏了，连检修 Wi-Fi 后从这里进 Pi。"),
+        layer("rescue-path", "检修通道", "ok" if rescue == "ok" else "warn", "Ops Wi-Fi、Console、Pi SSH 组成检修入口。", "主网络复杂路径坏了，连检修 Wi-Fi 后从这里进 Pi。"),
         layer("gateway-wan", "主路由 / WAN", gateway, "OpenWrt LuCI/SSH 是基础入口。", "如果这里异常，先查 OpenWrt WAN、DHCP、接口和防火墙。"),
-        layer("main-wifi-5g", "主 Wi-Fi / 5G", "tracked", "轻量 Console 不直接改无线；Wi-Fi 以 OpenWrt 为源工具。", "断电后来电 5G 不起时，只看 OpenWrt wireless/radio，不改 DNS/Proxy。"),
-        layer("room-ap", "卧室 WRT", room, "卧室覆盖由 WRT Room 承担。", "卧室慢时先查 WRT Room 回程和管理入口，不做全网重构。"),
+        layer("main-wifi-5g", "主 Wi-Fi / 5G", wifi_status, str((wifi_problem or {}).get("detail") or "主路由 5G radio、主 SSID、回程 SSID 已检查。"), "断电后来电 5G 不起时，只看 OpenWrt wireless/radio，不改 DNS/Proxy。"),
+        layer("room-ap", "卧室 WRT", room, room_detail, "卧室慢时先查 WRT Room 回程和管理入口，不做全网重构。", f"http://{ROOM_AP_IP}/"),
         layer("dns-proxy", "DNS / Proxy", dns_proxy, "AdGuard 负责 DNS，Mihomo 负责代理和分流。", "国内慢看 DIRECT/DNS，国外慢看 Mihomo 节点组和规则。"),
         layer("server-runtime", "Pi 服务", runtime, "Pi 承载 DNS、Proxy、HA、Kuma、WireGuard、Console 等服务。", "多个服务一起异常时先查 Docker/systemd/端口。"),
         layer("remote-access", "外部回家", remote, "外部入口由 Cloudflare、WireGuard、Caddy、DDNS 共同承担。", "本地入口正常后，再查 Cloudflare/WireGuard/Caddy。"),
@@ -331,6 +473,8 @@ def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], port
         "active_problem": active,
         "layers": layers,
         "entries": entries,
+        "power_recovery": wifi_checks,
+        "room_side_entry": wifi_recovery.get("room_side_entry") or f"http://{ROOM_AP_LOCAL_IP}/",
         "unmanaged_ports": unmanaged[:16],
         "unmanaged_port_count": len(unmanaged),
         "current_error_count": len(STATE.get("errors") or []),
@@ -344,13 +488,15 @@ async def refresh_state() -> None:
     try:
         metadata = await load_metadata()
         services, ports = await probe_services(metadata)
+        wifi_recovery = await probe_wifi_recovery(metadata)
         STATE.update({
             "ok": True,
             "metadata": {"schema": metadata.get("schema"), "profile": metadata.get("profile")},
             "instance": instance_from_metadata(metadata),
             "home_services": services,
             "ports": [{k: v for k, v in port.items() if k != "service_key"} for port in ports],
-            "console": build_console(metadata, services, ports),
+            "wifi_recovery": wifi_recovery,
+            "console": build_console(metadata, services, ports, wifi_recovery),
             "updated_at": time.time(),
         })
     except Exception as exc:

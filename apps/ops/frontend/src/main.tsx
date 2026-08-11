@@ -53,6 +53,8 @@ type ConsoleSummary = {
   unmanaged_port_count?: number;
   current_error_count?: number;
   historical_error_count?: number;
+  power_recovery?: ConsoleLayer[];
+  room_side_entry?: string;
 };
 
 type Service = {
@@ -112,6 +114,7 @@ type State = {
   home_services?: Service[];
   ports?: Port[];
   console?: ConsoleSummary;
+  wifi_recovery?: { ok?: boolean; checks?: ConsoleLayer[]; room_side_entry?: string };
   instance?: {
     site?: { display_name?: string; name?: string; domain?: string };
     networks?: Record<string, { cidr?: string; purpose?: string; dns_mode?: string; proxy_mode?: string }>;
@@ -384,6 +387,11 @@ function TopologyView({ state }: { state: State }) {
   const layers = state.console?.layers || [];
   const byId = new Map(layers.map((layer) => [layer.id, layer]));
   const domains = layerOrder.map((id) => byId.get(id) || { id, title: layerLabels[id], status: "unknown" });
+  const recovery = state.console?.power_recovery?.length
+    ? state.console.power_recovery
+    : state.wifi_recovery?.checks?.length
+      ? state.wifi_recovery.checks
+      : ["gateway-wan", "main-wifi-5g", "room-ap", "server-runtime"].map((id) => byId.get(id) || { id, title: layerLabels[id], status: "unknown" });
   const networks = state.instance?.networks || {};
   const wifi = state.instance?.wifi || {};
 
@@ -429,11 +437,9 @@ function TopologyView({ state }: { state: State }) {
 
       <Panel title="断电恢复" icon={<RadioTower size={18} />}>
         <div className="recoveryGrid">
-          {["gateway-wan", "main-wifi-5g", "room-ap", "server-runtime"].map((id) => {
-            const layer = byId.get(id) || { id, title: layerLabels[id], status: "unknown" };
-            return <LayerFocus key={id} layer={layer} />;
-          })}
+          {recovery.map((item) => <LayerFocus key={item.id || item.title} layer={item} />)}
         </div>
+        {state.console?.room_side_entry && <p className="note">连在卧室 WRT 下方时，房间侧管理入口：{state.console.room_side_entry}</p>}
       </Panel>
     </section>
   );
