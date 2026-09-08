@@ -3480,6 +3480,18 @@ def parse_dhcp_leases(text: str) -> dict[str, dict[str, str]]:
 def parse_ip_neigh(text: str) -> dict[str, dict[str, str]]:
     neighbours: dict[str, dict[str, str]] = {}
     mac_pattern = re.compile(r"\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b")
+
+    def priority(ip_value: str) -> int:
+        try:
+            ip_obj = ipaddress.ip_address(ip_value)
+        except ValueError:
+            return 0
+        if ip_obj.version == 4:
+            return 3
+        if ip_obj.version == 6 and not ip_obj.is_link_local:
+            return 2
+        return 1
+
     for line in text.splitlines():
         parts = line.split()
         if not parts:
@@ -3489,7 +3501,10 @@ def parse_ip_neigh(text: str) -> dict[str, dict[str, str]]:
         if not match:
             continue
         state = parts[-1] if parts else ""
-        neighbours[match.group(0).lower()] = {"ip": ip_value, "state": state}
+        mac = match.group(0).lower()
+        current = neighbours.get(mac)
+        if not current or priority(ip_value) >= priority(current.get("ip", "")):
+            neighbours[mac] = {"ip": ip_value, "state": state}
     return neighbours
 
 
@@ -4147,18 +4162,24 @@ def check_live(state: dict[str, Any], instance: Path, reporter: Reporter) -> Non
     leases_out, _, neigh_out = router_out.partition("__NEIGH__")
     leases = parse_dhcp_leases(leases_out)
     neighbours = parse_ip_neigh(neigh_out)
+    lease_hosts = {
+        str(row.get("hostname") or "").strip().lower(): row
+        for row in leases.values()
+        if str(row.get("hostname") or "").strip()
+    }
     live_ips_by_device: dict[str, list[str]] = {}
     for device in devices:
         expected = device.get("expected", True)
         presence = str(device.get("presence") or "always").strip().lower()
         expected_ip = str(device.get("ip") or "")
         macs = [str(m).lower() for m in as_list(device.get("macs"))]
+        hostnames = [str(h).strip().lower() for h in as_list(device.get("hostnames")) if str(h).strip()]
         device_id = str(device.get("id") or "")
         if not expected_ip or not macs:
             continue
         matches = [leases[mac] for mac in macs if mac in leases]
-        if not matches:
-            matches = [neighbours[mac] for mac in macs if mac in neighbours]
+        matches.extend(neighbours[mac] for mac in macs if mac in neighbours)
+        matches.extend(lease_hosts[host] for host in hostnames if host in lease_hosts)
         if not matches:
             if expected and presence in {"intermittent", "manual", "optional"}:
                 reporter.ok("live", f"{device_id} not in current DHCP/neighbour evidence; presence={presence}")
@@ -4167,9 +4188,17 @@ def check_live(state: dict[str, Any], instance: Path, reporter: Reporter) -> Non
             continue
         live_ips = sorted({m["ip"] for m in matches})
         if expected_ip in live_ips:
+            if device_id == "wrt-room" and not any(m["ip"] == expected_ip for m in matches if "state" in m):
+                room_ok, room_detail = tcp_probe(expected_ip, 22, timeout=2.0)
+                if room_ok:
+                    reporter.ok("live", f"{device_id} currently matches {expected_ip}; SSH reachable despite sparse neighbour evidence")
+                else:
+                    reporter.warn("live", f"{device_id} has DHCP lease for {expected_ip}, but no reachable neighbour evidence: {room_detail}")
+                live_ips_by_device[device_id] = live_ips
+                continue
             reporter.ok("live", f"{device_id} currently matches {expected_ip}")
         else:
-            reporter.fail("live", f"{device_id} expected {expected_ip}, current DHCP IP(s): {', '.join(live_ips)}")
+            reporter.warn("live", f"{device_id} online but expected {expected_ip}, current IP(s): {', '.join(live_ips)}")
         live_ips_by_device[device_id] = live_ips
     devices_by_id = {str(device.get("id") or ""): device for device in devices if isinstance(device, dict)}
     for device_id, device in devices_by_id.items():

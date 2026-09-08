@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import time
 from pathlib import Path
 from typing import Any
@@ -14,18 +15,23 @@ from aiohttp import web
 INSTANCE_DIR = Path(os.getenv("HOMENET_INSTANCE_DIR", "/homenet-instance")).resolve()
 HOMENET_TOOL = Path(os.getenv("HOMENET_PLAN_TOOL", "/tools/homenet.py")).resolve()
 MIHOMO_URL = os.getenv("MIHOMO_URL", "http://127.0.0.1:9090").rstrip("/")
+MIHOMO_HTTP_PROXY = os.getenv("MIHOMO_HTTP_PROXY", "http://192.168.10.5:7890")
 MIHOMO_CONFIG = os.getenv("MIHOMO_CONFIG", "/mihomo-config.yaml")
 MIHOMO_RUNTIME_CONFIG = os.getenv("MIHOMO_RUNTIME_CONFIG", "/root/.config/mihomo/config.yaml")
 MIHOMO_CONFIG_WRITE = Path(os.getenv("MIHOMO_CONFIG_WRITE", "/mihomo-config/config.yaml")).resolve()
 ROUTING_RULES_STORE = Path(os.getenv("ROUTING_RULES_STORE", "/runtime/routing/rules.json")).resolve()
 ROUTING_RULE_DIR = Path(os.getenv("ROUTING_RULE_DIR", "/mihomo-rules")).resolve()
-REFRESH = float(os.getenv("REFRESH", "15"))
+REFRESH = float(os.getenv("REFRESH", "60"))
+NETWORK_DIAGNOSTICS_INTERVAL = float(os.getenv("NETWORK_DIAGNOSTICS_INTERVAL", "300"))
 PORT = int(os.getenv("PORT", "9999"))
 OPENWRT_HOST = os.getenv("OPENWRT_HOST", "192.168.50.1")
 OPENWRT_USER = os.getenv("OPENWRT_USER", "root")
 ROOM_AP_IP = os.getenv("ROOM_AP_IP", "192.168.50.2")
 ROOM_AP_LOCAL_IP = os.getenv("ROOM_AP_LOCAL_IP", "192.168.1.1")
 OPENWRT_WAN_INTERFACE = os.getenv("OPENWRT_WAN_INTERFACE", "wan")
+INCIDENT_SAMPLE = Path(os.getenv("INCIDENT_SAMPLE", "/runtime/incidents/latest-network-sample.env"))
+INCIDENT_LOG = Path(os.getenv("INCIDENT_LOG", str(INCIDENT_SAMPLE.with_name("network-samples.log"))))
+WAN_RECOVERY_STATE = Path(os.getenv("WAN_RECOVERY_STATE", str(INCIDENT_SAMPLE.with_name("wan-recovery.state"))))
 
 STATE: dict[str, Any] = {
     "ok": False,
@@ -37,6 +43,7 @@ STATE: dict[str, Any] = {
     "ports": [],
     "devices": [],
     "foundation_checks": {"ok": False, "checks": []},
+    "network_diagnostics": {"ok": False, "checks": [], "summary": ""},
     "console": {"severity": "unknown", "headline": "Waiting for data", "layers": [], "entries": [], "unmanaged_ports": []},
 }
 
@@ -338,6 +345,233 @@ def check(check_id: str, title: str, status: str, detail: str, next_action: str 
     return {"id": check_id, "title": title, "status": status, "detail": detail, "next_action": next_action, "entry": entry}
 
 
+def latest_incident_sample() -> dict[str, Any] | None:
+    try:
+        raw = INCIDENT_SAMPLE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return None
+    sample: dict[str, Any] = {}
+    for token in tokens:
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        sample[key] = value
+    ts = str(sample.get("ts") or "")
+    if ts:
+        try:
+            parsed = time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
+            sample["age_seconds"] = max(0, int(time.time() - time.mktime(parsed)))
+        except ValueError:
+            pass
+    return sample
+
+
+def parse_incident_sample_line(raw: str) -> dict[str, Any] | None:
+    try:
+        tokens = shlex.split(raw.strip())
+    except ValueError:
+        return None
+    sample: dict[str, Any] = {}
+    for token in tokens:
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        sample[key] = value
+    return sample or None
+
+
+def router_wan_uptime(sample: dict[str, Any]) -> int | None:
+    parts = str(sample.get("router_wan") or "").split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def router_reboot_check() -> dict[str, Any] | None:
+    try:
+        lines = INCIDENT_LOG.read_text(encoding="utf-8").splitlines()[-90:]
+    except OSError:
+        return None
+    previous: tuple[str, int] | None = None
+    latest_drop: tuple[str, int, str, int] | None = None
+    for line in lines:
+        sample = parse_incident_sample_line(line)
+        if not sample:
+            continue
+        uptime = router_wan_uptime(sample)
+        ts = str(sample.get("ts") or "")
+        if uptime is None or not ts:
+            continue
+        if previous and previous[1] > 600 and uptime < 300 and uptime < previous[1] - 300:
+            latest_drop = (previous[0], previous[1], ts, uptime)
+        previous = (ts, uptime)
+    if not latest_drop:
+        return None
+    prev_ts, prev_uptime, ts, uptime = latest_drop
+    return check(
+        "router-reboot-detected",
+        "主路由发生过重启/重新拨号",
+        "warn",
+        f"{prev_ts} uptime={prev_uptime}s，{ts} uptime={uptime}s。",
+        "如果这是手动重启，它是恢复动作，不是根因；根因要看重启前 WAN 是否黑洞、PPPoE 是否重拨、DNS/公网是否同时失败。",
+        "http://192.168.10.1/cgi-bin/luci",
+    )
+
+
+def read_key_value_file(path: Path) -> dict[str, str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    result: dict[str, str] = {}
+    for line in lines:
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        result[key] = value
+    return result
+
+
+def wan_recovery_check() -> dict[str, Any]:
+    state = read_key_value_file(WAN_RECOVERY_STATE)
+    if not state:
+        return check("wan-recovery", "WAN 自动恢复", "warn", "还没有状态。", "等待采样脚本运行，或检查 network-incident-recorder。")
+    fail_count = int(state.get("fail_count") or 0)
+    threshold = int(state.get("threshold") or 5)
+    last_status = state.get("last_status") or "none"
+    last_action = int(state.get("last_action") or 0)
+    if last_status.startswith("redial-failed"):
+        return check("wan-recovery", "WAN 自动恢复", "bad", f"最近尝试失败：{last_status}。", "进入 OpenWrt 查看 WAN/PPPoE，必要时手动重拨或重启主路由。", "http://192.168.10.1/cgi-bin/luci")
+    if last_status.startswith("redial"):
+        age_seconds = max(0, int(time.time() - last_action)) if last_action else 0
+        return check("wan-recovery", "WAN 自动恢复", "warn", f"最近执行过 {last_status}，约 {age_seconds}s 前。", "如果网络已恢复，说明 WAN 黑洞重拨生效；如果未恢复，继续查运营商或主路由。")
+    if fail_count > 0:
+        return check("wan-recovery", "WAN 自动恢复", "warn", f"WAN 黑洞疑似计数 {fail_count}/{threshold}。", f"连续 {threshold} 次才会只重拨 WAN，不会重启路由或 Wi-Fi。")
+    return check("wan-recovery", "WAN 自动恢复", "ok", "待命；当前没有 WAN 黑洞计数。")
+
+
+def incident_sample_check() -> dict[str, Any]:
+    sample = latest_incident_sample()
+    if not sample:
+        return check("recent-network-sample", "最近故障留证", "warn", "还没有采样。", "等待 1 分钟，或检查 Pi crontab 中的 network-incident-recorder。")
+    age_seconds = int(sample.get("age_seconds") or 0)
+    fields = ["gateway", "pi", "room_ap", "internet", "adguard_dns", "public_dns", "mihomo"]
+    failed = [field for field in fields if str(sample.get(field) or "").startswith("fail")]
+    warned = [field for field in fields if str(sample.get(field) or "").startswith("warn")]
+    if age_seconds > 180:
+        return check("recent-network-sample", "最近故障留证", "warn", f"最近样本 {age_seconds}s 前，采样可能停了。", "检查 Pi crontab 和 runtime/incidents/network-incident-recorder.cron.log。")
+    if failed:
+        return check("recent-network-sample", "最近故障留证", "bad", f"{', '.join(failed)} 失败；样本 {age_seconds}s 前。", "按失败项从低层往上查：gateway、Pi、DNS、Mihomo。")
+    if warned:
+        return check("recent-network-sample", "最近故障留证", "warn", f"{', '.join(warned)} 警告；样本 {age_seconds}s 前。", "先看警告项对应的链路。")
+    return check("recent-network-sample", "最近故障留证", "ok", f"网关、Pi、卧室 WRT、DNS、Mihomo 最近 {age_seconds}s 内可达。")
+
+
+def parse_ping_summary(text: str) -> dict[str, float | int | None]:
+    packet_loss = None
+    avg = None
+    max_rtt = None
+    loss_match = re.search(r"(\d+(?:\.\d+)?)%\s*packet loss", text)
+    if loss_match:
+        packet_loss = float(loss_match.group(1))
+    rtt_match = re.search(r"(?:rtt|round-trip).*?=\s*([\d.]+)/([\d.]+)/([\d.]+)", text)
+    if rtt_match:
+        avg = float(rtt_match.group(2))
+        max_rtt = float(rtt_match.group(3))
+    return {"loss": packet_loss, "avg": avg, "max": max_rtt}
+
+
+def ping_status(summary: dict[str, float | int | None], warn_ms: float, bad_ms: float) -> str:
+    loss = float(summary.get("loss") or 0)
+    avg = summary.get("avg")
+    max_rtt = summary.get("max")
+    if loss >= 30:
+        return "bad"
+    if loss > 0:
+        return "warn"
+    if avg is not None and float(avg) >= bad_ms:
+        return "bad"
+    if avg is not None and float(avg) >= warn_ms:
+        return "warn"
+    if max_rtt is not None and float(max_rtt) >= bad_ms * 2:
+        return "warn"
+    return "ok"
+
+
+def parse_station_dump(text: str) -> list[dict[str, Any]]:
+    stations: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in text.splitlines():
+        station = re.match(r"^Station\s+([0-9a-f:]+)", line.strip(), re.I)
+        if station:
+            if current:
+                stations.append(current)
+            current = {"mac": normalize_mac(station.group(1))}
+            continue
+        if not current:
+            continue
+        signal = re.search(r"signal:\s*(-?\d+)", line)
+        if signal:
+            current["signal"] = int(signal.group(1))
+        tx = re.search(r"tx bitrate:\s*([\d.]+)", line)
+        if tx:
+            current["tx_mbps"] = float(tx.group(1))
+        rx = re.search(r"rx bitrate:\s*([\d.]+)", line)
+        if rx:
+            current["rx_mbps"] = float(rx.group(1))
+    if current:
+        stations.append(current)
+    return stations
+
+
+def mac_suffix(mac: str) -> str:
+    normalized = normalize_mac(mac)
+    return normalized[-8:] if normalized else ""
+
+
+def device_names_by_mac(metadata: dict[str, Any]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for device in metadata.get("devices") or []:
+        if not isinstance(device, dict):
+            continue
+        name = str(device.get("name") or device.get("id") or "")
+        for mac in device.get("macs") or []:
+            result[normalize_mac(str(mac))] = name
+    for device_id, detail in instance_device_details().items():
+        name = str(detail.get("name") or device_id)
+        for mac in detail.get("macs") or []:
+            result[normalize_mac(str(mac))] = name
+    return result
+
+
+def weak_wifi_items(stations: list[dict[str, Any]], names: dict[str, str], threshold: int = -70) -> list[dict[str, Any]]:
+    weak = []
+    for station in stations:
+        signal = station.get("signal")
+        tx = station.get("tx_mbps")
+        if signal is None:
+            continue
+        if int(signal) <= threshold or (tx is not None and float(tx) <= 24):
+            mac = str(station.get("mac") or "")
+            weak.append({
+                "mac": mac,
+                "label": names.get(mac) or mac_suffix(mac),
+                "signal": signal,
+                "tx_mbps": tx,
+                "rx_mbps": station.get("rx_mbps"),
+            })
+    return weak
+
+
 def first_problem(items: list[dict[str, Any]]) -> dict[str, Any] | None:
     return next((item for item in sorted(items, key=lambda item: severity(str(item.get("status") or "unknown")), reverse=True) if item.get("status") in {"bad", "down", "warn", "unknown"}), None)
 
@@ -522,34 +756,79 @@ async def probe_devices(metadata: dict[str, Any]) -> dict[str, Any]:
         add_error(f"device probe failed: {type(exc).__name__}: {exc}")
         leases, neighbors, probe_ok = {}, {}, False
 
+    leases_by_mac = {
+        normalize_mac(str(lease.get("mac") or "")): lease
+        for lease in leases.values()
+        if normalize_mac(str(lease.get("mac") or ""))
+    }
+    leases_by_hostname = {
+        str(lease.get("hostname") or "").strip().lower(): lease
+        for lease in leases.values()
+        if str(lease.get("hostname") or "").strip()
+    }
+
     rows = []
     seen_ips: set[str] = set()
     for device in devices:
         ip = str(device.get("ip") or "")
         if not ip:
             continue
-        seen_ips.add(ip)
         expected_macs = {normalize_mac(mac) for mac in device.get("macs") or []}
+        expected_hosts = {str(host).strip().lower() for host in device.get("hostnames") or [] if str(host).strip()}
         lease = leases.get(ip) or {}
-        neighbor = neighbors.get(ip) or {}
+        if not lease:
+            lease = next((leases_by_mac[mac] for mac in expected_macs if mac in leases_by_mac), {})
+        if not lease:
+            lease = next((leases_by_hostname[host] for host in expected_hosts if host in leases_by_hostname), {})
+        current_ip = str(lease.get("ip") or ip)
+        seen_ips.add(ip)
+        if current_ip:
+            seen_ips.add(current_ip)
+        neighbor = neighbors.get(current_ip) or neighbors.get(ip) or {}
         lease_mac = normalize_mac(str(lease.get("mac") or ""))
         neighbor_mac = normalize_mac(str(neighbor.get("mac") or ""))
         current_mac = neighbor_mac or lease_mac
         lease_matches = bool(lease_mac and (not expected_macs or lease_mac in expected_macs))
         neighbor_matches = bool(neighbor_mac and (not expected_macs or neighbor_mac in expected_macs))
         via_room = bool(neighbor_mac and neighbor_mac in room_macs and lease_matches and device.get("id") != "wrt-room")
+        if via_room and lease_mac:
+            current_mac = lease_mac
         evidence = []
         if lease:
             evidence.append("DHCP")
         if neighbor:
             evidence.append(f"neighbor {neighbor.get('state') or 'seen'}")
+        device_id = str(device.get("id") or "")
         presence = str(device.get("presence") or "")
         expected = bool(device.get("expected", True))
-        if not probe_ok:
+        if ip == OPENWRT_HOST or device_id == "openwrt-gateway":
+            status = "ok"
+            detail = "在线，主路由基础探测已通过"
+            if "router-probe" not in evidence:
+                evidence.append("router-probe")
+        elif ip in {"127.0.0.1", "localhost"}:
+            status = "ok"
+            detail = "在线，本机运行环境"
+            evidence.append("local")
+        elif ip == "192.168.10.5" or device_id == "raspberrypi":
+            status = "ok"
+            detail = "在线，Console 正在此设备运行"
+            if "local-runtime" not in evidence:
+                evidence.append("local-runtime")
+        elif device_id == "wrt-room" and lease_matches and not neighbor_matches:
+            status = "offline"
+            detail = "离线；只有 DHCP 租约，当前不可达"
+        elif not probe_ok:
             status, detail = "unknown", "无法读取主路由 DHCP/neighbor 证据。"
         elif via_room:
             status = "ok"
             detail = "在线，经 WRT Room 中继/proxy ARP"
+            if current_ip and current_ip != ip:
+                status = "warn"
+                detail = f"在线，经 WRT Room 中继/proxy ARP，当前 IP 为 {current_ip}"
+        elif lease_matches and current_ip and current_ip != ip:
+            status = "warn"
+            detail = f"在线，当前 IP 为 {current_ip}，等待重新获取固定地址"
         elif neighbor_matches or lease_matches:
             status = "ok"
             detail = "在线"
@@ -569,11 +848,12 @@ async def probe_devices(metadata: dict[str, Any]) -> dict[str, Any]:
             status = "offline"
             detail = "未在线"
         rows.append({
-            "id": device.get("id"),
+            "id": device_id or device.get("id"),
             "name": device.get("name") or device.get("id"),
             "role": device.get("role") or "",
             "network": device.get("network") or "",
             "ip": ip,
+            "current_ip": current_ip,
             "expected": expected,
             "presence": presence,
             "expected_macs": sorted(expected_macs),
@@ -702,7 +982,172 @@ async def probe_foundation_checks(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], ports: list[dict[str, Any]], foundation_checks: dict[str, Any] | None = None) -> dict[str, Any]:
+async def timed_http_probe(session: aiohttp.ClientSession, probe_id: str, label: str, url: str, warn_ms: int, bad_ms: int, next_action: str, proxy: str | None = None) -> dict[str, Any]:
+    started = time.time()
+    try:
+        async with session.get(url, allow_redirects=True, proxy=proxy) as resp:
+            await resp.read()
+            elapsed = round((time.time() - started) * 1000)
+            if resp.status >= 500 or elapsed >= bad_ms:
+                status = "bad"
+            elif resp.status >= 400 or elapsed >= warn_ms:
+                status = "warn"
+            else:
+                status = "ok"
+            return check(probe_id, label, status, f"HTTP {resp.status} · {elapsed} ms", next_action)
+    except Exception as exc:
+        return check(probe_id, label, "bad", f"{type(exc).__name__}", next_action)
+
+
+async def mihomo_snapshot() -> dict[str, Any]:
+    secret = load_mihomo_secret()
+    headers = {"Authorization": f"Bearer {secret}"} if secret else {}
+    timeout = aiohttp.ClientTimeout(total=3)
+    result: dict[str, Any] = {"ok": False, "groups": [], "connections": 0, "top_chains": []}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(f"{MIHOMO_URL}/proxies") as resp:
+            proxies = await resp.json()
+        proxy_map = proxies.get("proxies") or {}
+        for name in ["PROXY", "PROXY-AUTO", "PROXY-JAPAN", "AI-AUTO", "AI-NODES", "GLOBAL"]:
+            item = proxy_map.get(name)
+            if item:
+                result["groups"].append({"name": name, "type": item.get("type"), "now": item.get("now")})
+        try:
+            async with session.get(f"{MIHOMO_URL}/connections") as resp:
+                connections = await resp.json()
+            rows = connections.get("connections") or []
+            result["connections"] = len(rows)
+            chains: dict[str, int] = {}
+            for row in rows:
+                chain = ">".join(row.get("chains") or []) or "unknown"
+                chains[chain] = chains.get(chain, 0) + 1
+            result["top_chains"] = [
+                {"chain": chain, "count": count}
+                for chain, count in sorted(chains.items(), key=lambda item: item[1], reverse=True)[:6]
+            ]
+        except Exception:
+            pass
+    result["ok"] = True
+    return result
+
+
+async def probe_network_diagnostics(metadata: dict[str, Any]) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    facts: dict[str, Any] = {}
+    names = device_names_by_mac(metadata)
+    reboot = router_reboot_check()
+    if reboot:
+        checks.append(reboot)
+    checks.append(incident_sample_check())
+    checks.append(wan_recovery_check())
+
+    command = (
+        "echo __PING_CN__; ping -c 4 -W 2 223.5.5.5 2>/dev/null || true; "
+        "echo __PING_CF__; ping -c 4 -W 2 1.1.1.1 2>/dev/null || true; "
+        "echo __MAIN_5G__; iw dev wlan1 station dump 2>/dev/null || true; "
+        "echo __RELAY__; iw dev wlan1-2 station dump 2>/dev/null || true"
+    )
+    try:
+        text = await run_text_command(router_ssh_args(command), timeout=12)
+        cn = parse_ping_summary(extract_block(text, "__PING_CN__", "__PING_CF__"))
+        cf = parse_ping_summary(extract_block(text, "__PING_CF__", "__MAIN_5G__"))
+        checks.append(check(
+            "wan-domestic",
+            "国内直连",
+            ping_status(cn, 50, 150),
+            f"223.5.5.5 avg={cn.get('avg') if cn.get('avg') is not None else '?'} ms loss={cn.get('loss') if cn.get('loss') is not None else '?'}%",
+            "国内直连异常时先查宽带/WAN，不要先改代理。",
+        ))
+        cf_status = ping_status(cf, 180, 350)
+        checks.append(check(
+            "wan-foreign-ip",
+            "国外基础 IP",
+            "ok" if cf_status == "warn" else cf_status,
+            f"1.1.1.1 avg={cf.get('avg') if cf.get('avg') is not None else '?'} ms loss={cf.get('loss') if cf.get('loss') is not None else '?'}%",
+            "这个只作为参考；家庭网络是否异常主要看国内直连、Google/GitHub 代理路径和 DNS/Proxy。",
+        ))
+        main_weak = weak_wifi_items(parse_station_dump(extract_block(text, "__MAIN_5G__", "__RELAY__")), names)
+        relay_weak = weak_wifi_items(parse_station_dump(extract_block(text, "__RELAY__")), names, threshold=-68)
+        facts["main_weak_clients"] = main_weak
+        facts["relay_weak_clients"] = relay_weak
+        if main_weak:
+            detail = ", ".join(f"{item['label']} {item['signal']}dBm/{item.get('tx_mbps') or '?'}Mbps" for item in main_weak[:4])
+            checks.append(check("wifi-weak-clients", "弱 Wi-Fi 客户端", "warn", detail, "设备在卧室却挂主路由弱信号时，先开关 Wi-Fi 或手动重连。"))
+        else:
+            checks.append(check("wifi-weak-clients", "弱 Wi-Fi 客户端", "ok", "主路由 5G 未发现明显弱客户端。"))
+        if relay_weak:
+            detail = ", ".join(f"{item['label']} {item['signal']}dBm/{item.get('tx_mbps') or '?'}Mbps" for item in relay_weak[:3])
+            checks.append(check("wifi-room-backhaul", "卧室回程质量", "warn", detail, "卧室整体慢时，优先考虑 WRT Room 与主路由之间的回程信号。"))
+        else:
+            checks.append(check("wifi-room-backhaul", "卧室回程质量", "ok", "WRT Room 回程未发现明显弱信号。"))
+    except Exception as exc:
+        checks.append(check("router-speed-probe", "路由侧测速证据", "warn", f"{type(exc).__name__}: {exc}", "主路由 SSH 探测失败时先确认 OpenWrt 可达。"))
+
+    timeout = aiohttp.ClientTimeout(total=5)
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "HomeNetConsole/1.0"}, connector=connector) as session:
+        checks.extend(await asyncio.gather(
+            timed_http_probe(session, "http-domestic", "国内网站", "https://www.baidu.com", 800, 2000, "国内网站慢时先看 WAN/DNS。"),
+            timed_http_probe(session, "http-google", "Google 代理路径", "https://www.google.com", 2500, 6000, "Google 慢而国内正常时，先看 Mihomo 当前节点。", proxy=MIHOMO_HTTP_PROXY),
+            timed_http_probe(session, "http-github", "GitHub 代理路径", "https://github.com", 3500, 8000, "GitHub 慢通常是代理节点或规则链路问题。", proxy=MIHOMO_HTTP_PROXY),
+            return_exceptions=False,
+        ))
+
+    try:
+        mihomo = await mihomo_snapshot()
+        facts["mihomo"] = mihomo
+        group_text = ", ".join(f"{item['name']}={item.get('now')}" for item in mihomo.get("groups", [])[:5])
+        conn_count = int(mihomo.get("connections") or 0)
+        status = "warn" if conn_count >= 300 else "ok"
+        checks.append(check("mihomo-current", "Mihomo 当前出口", status, f"{group_text}; connections={conn_count}", "外网慢时先看 PROXY/PROXY-JAPAN/AI-AUTO 当前选中节点。", "http://192.168.10.5:9090/ui/#/proxies"))
+    except Exception as exc:
+        checks.append(check("mihomo-current", "Mihomo 当前出口", "warn", f"{type(exc).__name__}", "无法读取控制器时进入 Mihomo Dashboard。", "http://192.168.10.5:9090/ui/#/proxies"))
+
+    by_id = {item.get("id"): item for item in checks}
+    domestic_ok = str((by_id.get("wan-domestic") or {}).get("status")) == "ok" and str((by_id.get("http-domestic") or {}).get("status")) == "ok"
+    foreign_bad = any(str((by_id.get(key) or {}).get("status")) in {"bad", "down"} for key in ["http-google", "http-github"])
+    room_warn = str((by_id.get("wifi-room-backhaul") or {}).get("status")) == "warn"
+    weak_clients = str((by_id.get("wifi-weak-clients") or {}).get("status")) == "warn"
+    mihomo_detail = str((by_id.get("mihomo-current") or {}).get("detail") or "")
+    if domestic_ok and foreign_bad:
+        verdict_title = "国外访问慢/超时"
+        detail = "国内直连正常，Google/GitHub 超时；问题优先在国外出口、代理节点或规则链路。"
+        if room_warn:
+            detail += " 卧室回程偏弱，会叠加影响卧室设备。"
+        next_action = "先打开 Mihomo，把 PROXY-JAPAN 手动切到 JP-1/JP-2/JP-3/JP-4 中可用的节点；仍慢再看分流规则或临时把目标域名指定到稳定组。"
+        summary = next_action
+        verdict_status = "bad"
+    elif room_warn or weak_clients:
+        verdict_title = "卧室无线可能慢"
+        detail = "外网没有明显全局超时，但无线链路有弱信号证据。"
+        next_action = "如果是在卧室慢，先确认设备连的是 WRT Room 覆盖的 Wi-Fi；必要时重连 Wi-Fi，不要先改代理。"
+        summary = next_action
+        verdict_status = "warn"
+    elif not domestic_ok:
+        verdict_title = "宽带/WAN/DNS 可能异常"
+        detail = "国内直连或国内网站也异常，问题优先在宽带、WAN、DNS 或主路由。"
+        next_action = "先看 OpenWrt WAN、PPPoE、dnsmasq 和 AdGuard，不要先切代理节点。"
+        summary = next_action
+        verdict_status = "bad"
+    else:
+        verdict_title = "网络正常"
+        detail = "国内、国外、Wi-Fi、代理核心证据正常。"
+        next_action = "当前不用处理；如果某个单独网站慢，用分流页给它临时指定出口。"
+        summary = detail
+        verdict_status = "ok"
+    if mihomo_detail and verdict_status != "ok":
+        detail += f" 当前出口：{mihomo_detail}"
+    checks.insert(0, check("network-verdict", verdict_title, verdict_status, detail, next_action, "http://192.168.10.5:9090/ui/#/proxies" if foreign_bad else ""))
+    return {
+        "ok": not any(item.get("status") in {"bad", "down", "warn"} for item in checks),
+        "updated_at": time.time(),
+        "summary": summary,
+        "checks": checks,
+        "facts": facts,
+    }
+
+
+def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], ports: list[dict[str, Any]], foundation_checks: dict[str, Any] | None = None, network_diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
     gateway = domain_status([service_status(services, "openwrt-luci"), service_status(services, "openwrt-ssh")])
     foundation_checks = foundation_checks or {"checks": []}
     foundation_items = list(foundation_checks.get("checks") or [])
@@ -712,7 +1157,11 @@ def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], port
     wifi_problem = first_problem([foundation_by_id.get(key) for key in wifi_keys if foundation_by_id.get(key)] or [])
     room_probe = str((foundation_by_id.get("room-ap") or {}).get("status") or "unknown")
     room = domain_status([service_status(services, "wrt-room-luci"), service_status(services, "wrt-room-ssh"), room_probe])
-    dns_proxy = domain_status([service_status(services, "adguard"), service_status(services, "mihomo")])
+    network_diagnostics = network_diagnostics or {"checks": []}
+    network_items = list(network_diagnostics.get("checks") or [])
+    network_by_id = {item.get("id"): item for item in network_items}
+    proxy_status = domain_status([str((network_by_id.get(key) or {}).get("status") or "unknown") for key in ["http-google", "http-github", "mihomo-current"]])
+    dns_proxy = domain_status([service_status(services, "adguard"), service_status(services, "mihomo"), proxy_status])
     runtime = domain_status([service_status(services, key) for key in ["homenet-ops", "adguard", "mihomo", "home-assistant", "uptime-kuma", "cloudflared", "wireguard"]])
     remote = domain_status([service_status(services, key) for key in ["cloudflared", "wireguard", "caddy", "ddns-go"]])
     rescue = domain_status([service_status(services, "homenet-ops"), service_status(services, "pi-ssh"), str((foundation_by_id.get("wifi-ops") or {}).get("status") or "unknown")])
@@ -760,6 +1209,8 @@ def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], port
         "layers": layers,
         "entries": entries,
         "foundation_checks": foundation_items,
+        "network_diagnostics": network_items,
+        "network_diagnostics_summary": network_diagnostics.get("summary") or "",
         "room_side_entry": foundation_checks.get("room_side_entry") or f"http://{ROOM_AP_LOCAL_IP}/",
         "unmanaged_ports": unmanaged[:16],
         "unmanaged_port_count": len(unmanaged),
@@ -770,11 +1221,22 @@ def build_console(metadata: dict[str, Any], services: list[dict[str, Any]], port
     }
 
 
-async def refresh_state() -> None:
+def network_diagnostics_stale() -> bool:
+    diagnostics = STATE.get("network_diagnostics") or {}
+    updated_at = float(diagnostics.get("updated_at") or 0)
+    return not diagnostics.get("checks") or time.time() - updated_at >= NETWORK_DIAGNOSTICS_INTERVAL
+
+
+async def refresh_state(probe_network: bool = True) -> None:
     try:
         metadata = await load_metadata()
         services, ports = await probe_services(metadata)
         foundation_checks = await probe_foundation_checks(metadata)
+        network_diagnostics = (
+            await probe_network_diagnostics(metadata)
+            if probe_network and network_diagnostics_stale()
+            else STATE.get("network_diagnostics") or {"ok": False, "checks": [], "summary": "等待网络诊断。"}
+        )
         devices = await probe_devices(metadata)
         STATE.update({
             "ok": True,
@@ -784,7 +1246,8 @@ async def refresh_state() -> None:
             "ports": [{k: v for k, v in port.items() if k != "service_key"} for port in ports],
             "devices": devices,
             "foundation_checks": foundation_checks,
-            "console": build_console(metadata, services, ports, foundation_checks),
+            "network_diagnostics": network_diagnostics,
+            "console": build_console(metadata, services, ports, foundation_checks, network_diagnostics),
             "updated_at": time.time(),
         })
     except Exception as exc:
@@ -929,6 +1392,14 @@ async def api_health(request: web.Request) -> web.Response:
         }
         for layer in console.get("layers", [])
     ]
+    checks.extend(
+        {
+            "status": item.get("status"),
+            "title": item.get("title"),
+            "detail": item.get("detail"),
+        }
+        for item in (console.get("network_diagnostics") or [])
+    )
     return web.json_response({
         "ok": bool(console.get("ok")),
         "updated_at": console.get("updated_at") or STATE.get("updated_at"),
@@ -1022,13 +1493,14 @@ async def events(request: web.Request) -> web.StreamResponse:
         while True:
             await response.write(f"data: {json.dumps(STATE, ensure_ascii=False)}\n\n".encode())
             await asyncio.sleep(REFRESH)
-    except (asyncio.CancelledError, ConnectionResetError):
+    except (asyncio.CancelledError, ConnectionError, ConnectionResetError, OSError):
         pass
     return response
 
 
 async def index(request: web.Request) -> web.Response:
-    return web.FileResponse(Path(__file__).with_name("static") / "index.html")
+    html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
+    return web.Response(text=html, content_type="text/html")
 
 
 async def sampler(app: web.Application) -> None:
@@ -1038,7 +1510,7 @@ async def sampler(app: web.Application) -> None:
 
 
 async def on_startup(app: web.Application) -> None:
-    await refresh_state()
+    await refresh_state(probe_network=False)
     app["sampler"] = asyncio.create_task(sampler(app))
 
 

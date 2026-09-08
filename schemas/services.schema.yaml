@@ -10,7 +10,7 @@ fields:
       fields:
         id: string
         name: string
-        category: enum(gateway, network-core, home-core, control-core, remote-entry, storage, system-task, udp-entry, external)
+        category: enum(gateway, network-core, home-core, daily-app, control-core, remote-entry, storage, system-task, udp-entry, external)
         role: string
         host: ipv4_or_hostname
         owner: string

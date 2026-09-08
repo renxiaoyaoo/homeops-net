@@ -39,7 +39,7 @@ def service_module_id(service: dict[str, Any]) -> str:
         if "wireguard" in service_id or "cloudflared" in service_id or "caddy" in service_id or "ddns" in service_id:
             return "remote-access"
         return "gateway-openwrt"
-    if category == "storage":
+    if category in {"storage", "daily-app"}:
         return "server-runtime"
     if runtime == "server":
         return "server-runtime"

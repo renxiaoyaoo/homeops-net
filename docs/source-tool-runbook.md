@@ -263,12 +263,16 @@ Minimal setup:
 Current relayd note:
 
 - From the main LAN, Pi, or the main OpenWrt gateway, manage the Room AP at
-  `http://192.168.50.2/`.
+  `http://<room-ap-management-ip>/`.
 - From a phone or laptop currently connected below the Room AP, manage the same
-  device at `http://192.168.50.1/`.
+  device at `http://<room-ap-local-ip>/`.
 - This split is expected for the current relayd deployment. A WDS/4addr or
   802.11s design can remove this split, but changing to it is a disruptive
   wireless-backhaul migration and must be planned as a dedicated change.
+- 802.11r is optional. If hostapd repeatedly reports key-install failures or
+  disconnects clients during transitions, disable FT consistently on all APs
+  sharing the SSID. Keep 802.11k if useful; clients still perform ordinary
+  roaming without FT.
 
 Verify:
 

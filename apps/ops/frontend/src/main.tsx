@@ -55,6 +55,8 @@ type ConsoleSummary = {
   current_error_count?: number;
   historical_error_count?: number;
   foundation_checks?: ConsoleLayer[];
+  network_diagnostics?: ConsoleLayer[];
+  network_diagnostics_summary?: string;
   room_side_entry?: string;
 };
 
@@ -111,6 +113,7 @@ type Device = {
   role?: string;
   network?: string;
   ip?: string;
+  current_ip?: string;
   expected?: boolean;
   presence?: string;
   expected_macs?: string[];
@@ -137,6 +140,7 @@ type State = {
   devices?: { ok?: boolean; summary?: { total?: number; online?: number; attention?: number; standby?: number }; items?: Device[] };
   console?: ConsoleSummary;
   foundation_checks?: { ok?: boolean; checks?: ConsoleLayer[]; room_side_entry?: string };
+  network_diagnostics?: { ok?: boolean; summary?: string; checks?: ConsoleLayer[]; updated_at?: number };
   instance?: {
     site?: { display_name?: string; name?: string; domain?: string };
     networks?: Record<string, { cidr?: string; purpose?: string; dns_mode?: string; proxy_mode?: string }>;
@@ -203,8 +207,7 @@ function cls(status?: Status) {
   if (status === "ok") return "ok";
   if (status === "warn") return "warn";
   if (status === "bad" || status === "down" || status === "offline") return "bad";
-  if (status === "tracked") return "tracked";
-  if (status === "sleeping") return "tracked";
+  if (status === "tracked" || status === "sleeping") return "warn";
   return "unknown";
 }
 
@@ -217,14 +220,144 @@ function icon(status?: Status) {
 }
 
 function label(status?: Status) {
+  if (status === "offline") return "离线";
+  if (status === "sleeping" || status === "tracked") return "离线";
   const c = cls(status);
   if (c === "ok") return "正常";
   if (c === "bad") return "异常";
   if (c === "warn") return "注意";
-  if (status === "offline") return "离线";
-  if (status === "sleeping") return "可离线";
-  if (c === "tracked") return "已记录";
   return "等待";
+}
+
+function statusRank(status?: Status) {
+  const c = cls(status);
+  if (c === "bad") return 4;
+  if (c === "warn") return 3;
+  if (c === "unknown") return 2;
+  return 0;
+}
+
+function allChecks(state: State) {
+  const summary = state.console || {};
+  return [
+    ...(summary.network_diagnostics || []),
+    ...(state.network_diagnostics?.checks || []),
+    ...(summary.foundation_checks || []),
+    ...(state.foundation_checks?.checks || []),
+    ...(summary.layers || [])
+  ];
+}
+
+function checkById(state: State, id: string) {
+  return allChecks(state).find((item) => item.id === id);
+}
+
+function statusIsProblem(status?: Status) {
+  return ["bad", "warn", "down", "offline"].includes(cls(status));
+}
+
+type HomeIncident = {
+  status: Status;
+  title: string;
+  summary: string;
+  action: string;
+  entry?: string;
+  evidence: string[];
+};
+
+function buildHomeIncident(state: State): HomeIncident {
+  const get = (id: string) => checkById(state, id);
+  const wanRecovery = get("wan-recovery");
+  const wan = get("wan-domestic") || get("gateway-wan");
+  const domestic = get("http-domestic");
+  const google = get("http-google");
+  const github = get("http-github");
+  const room = get("wifi-room-backhaul") || get("room-ap");
+  const mihomo = get("mihomo-current");
+  const pi = get("server-runtime");
+  const dns = get("dns-proxy");
+  const reboot = get("router-reboot-detected");
+
+  const evidence = (...items: Array<ConsoleLayer | undefined>) =>
+    items
+      .filter(Boolean)
+      .slice(0, 4)
+      .map((item) => `${item!.title || item!.id}: ${item!.detail || label(item!.status)}`);
+
+  if (wanRecovery && cls(wanRecovery.status) === "bad") {
+    return {
+      status: "bad",
+      title: "宽带恢复失败",
+      summary: "主路由拿到地址但外网不通，自动只重拨 WAN 也没有恢复。",
+      action: "进 OpenWrt 看 WAN/PPPoE；必要时手动重拨或重启主路由。",
+      entry: wanRecovery.entry || "http://192.168.10.1/cgi-bin/luci",
+      evidence: evidence(wanRecovery, wan, domestic)
+    };
+  }
+
+  if (wanRecovery && cls(wanRecovery.status) === "warn") {
+    return {
+      status: "warn",
+      title: "宽带疑似假在线",
+      summary: "网关还活着，但公网连通异常。系统会连续确认后只重拨 WAN，不动 Wi-Fi/Pi/Docker。",
+      action: "先等自动重拨；如果仍无网，再进 OpenWrt 处理 WAN。",
+      entry: wanRecovery.entry || "http://192.168.10.1/cgi-bin/luci",
+      evidence: evidence(wanRecovery, wan, domestic)
+    };
+  }
+
+  if (statusIsProblem(wan?.status) || statusIsProblem(domestic?.status)) {
+    return {
+      status: "bad",
+      title: "基础上网异常",
+      summary: "国内直连或主路由 WAN 不正常，这类问题通常不是代理、不是 Home Assistant。",
+      action: "先看 OpenWrt 的 WAN、PPPoE、DNS；不要先重启 Pi 上的服务。",
+      entry: wan?.entry || domestic?.entry || "http://192.168.10.1/cgi-bin/luci",
+      evidence: evidence(wan, domestic, reboot)
+    };
+  }
+
+  if (statusIsProblem(room?.status)) {
+    return {
+      status: "warn",
+      title: "卧室覆盖不稳",
+      summary: "主网络可能正常，但卧室 WRT 与主路由之间的无线回程偏弱，卧室设备会慢或断续。",
+      action: "卧室出问题时先确认设备是否连到 WRT Room；长期解法是调整位置或换更稳定回程。",
+      entry: room?.entry || state.console?.room_side_entry || "http://192.168.10.2",
+      evidence: evidence(room, wan, domestic)
+    };
+  }
+
+  if (statusIsProblem(google?.status) || statusIsProblem(github?.status) || statusIsProblem(mihomo?.status)) {
+    return {
+      status: "warn",
+      title: "代理路径异常",
+      summary: "国内网络正常，但 Google/GitHub 或当前出口异常，问题集中在 Mihomo 节点/分流。",
+      action: "打开 Mihomo，切换 PROXY / PROXY-JAPAN / AI-AUTO 当前节点。",
+      entry: mihomo?.entry || "http://192.168.10.5:9090/ui/#/proxies",
+      evidence: evidence(google, github, mihomo)
+    };
+  }
+
+  if (statusIsProblem(pi?.status) || statusIsProblem(dns?.status)) {
+    return {
+      status: "warn",
+      title: "Pi 或 DNS/Proxy 服务异常",
+      summary: "路由层正常，但 Pi 上的 DNS、代理、Docker 或应用可能有问题。",
+      action: "先看 Pi 服务和 Docker 状态，再看具体应用。",
+      entry: pi?.entry || dns?.entry || "http://192.168.10.5:9999",
+      evidence: evidence(pi, dns, wan)
+    };
+  }
+
+  return {
+    status: "ok",
+    title: "当前网络正常",
+    summary: "国内直连、代理路径、Pi 服务、卧室 WRT 都没有发现会阻断上网的异常。",
+    action: "不用处理。某个 App 慢时再去分流或 Mihomo 切换节点。",
+    entry: "http://192.168.10.5:9999",
+    evidence: evidence(wan, domestic, google, room)
+  };
 }
 
 function mbps(value?: number) {
@@ -364,44 +497,70 @@ function App() {
 }
 
 function HomeView({ state }: { state: State }) {
-  const summary = state.console || {};
-  const layers = summary.layers || [];
-  const problem = summary.active_problem || layers.find((layer) => ["bad", "warn"].includes(cls(layer.status)));
-  const rescue = layers.find((layer) => layer.id === "rescue-path");
-  const entries = summary.entries || [];
-  const severity = summary.severity || (summary.ok ? "ok" : "unknown");
+  const incident = buildHomeIncident(state);
+  const entries = state.console?.entries || [];
+  const entryMap = new Map(entries.map((entry) => [entry.id || entry.name || entry.label, entry]));
+  const quickEntries = [
+    entryMap.get("openwrt-luci") || { id: "openwrt-luci", label: "主路由", role: "WAN / Wi-Fi", local_href: "http://192.168.10.1/cgi-bin/luci", status: "ok" },
+    entryMap.get("mihomo") || { id: "mihomo", label: "Mihomo", role: "代理节点", local_href: "http://192.168.10.5:9090/ui/#/proxies", status: "ok" },
+    entryMap.get("homenet-ops") || { id: "homenet-ops", label: "Ops", role: "当前页面", local_href: "http://192.168.10.5:9999", status: "ok" },
+    entryMap.get("home-assistant") || { id: "home-assistant", label: "Home Assistant", role: "智能家居", local_href: "http://192.168.10.5:8123", status: "ok" }
+  ];
+  const rescue = (state.console?.layers || []).find((layer) => layer.id === "rescue-path");
 
   return (
-    <section className="homeGrid">
-      <Panel title="现在" icon={<Compass size={18} />}>
-        <div className={`verdict ${cls(severity)}`}>
-          {icon(severity)}
-          <div>
-            <span>{label(severity)}</span>
-            <b>{summary.headline || "等待状态"}</b>
-            <p>{problem?.next_action || "关键链路正常。需要操作时从下面入口进入对应工具。"}</p>
+    <section className="homeSimple">
+      <div className={`answerCard ${cls(incident.status)}`}>
+        <div className="answerIcon">{icon(incident.status)}</div>
+        <div>
+          <span>{label(incident.status)}</span>
+          <h2>{incident.title}</h2>
+          <p>{incident.summary}</p>
+        </div>
+      </div>
+
+      <div className="actionGrid">
+        <Panel title="下一步" icon={<Wrench size={18} />}>
+          <div className="nextAction">
+            <b>{incident.action}</b>
+            {incident.entry && <a href={incident.entry} target="_blank" rel="noreferrer">打开处理入口<ArrowUpRight size={14} /></a>}
           </div>
-        </div>
-      </Panel>
+        </Panel>
 
-      <Panel title="常用入口" icon={<Home size={18} />}>
-        <div className="entryList">
-          {entries.slice(0, 8).map((entry) => <Entry key={entry.id || entry.name} entry={entry} />)}
-          {!entries.length && <EmptyLine text="等待服务入口。" />}
-        </div>
-      </Panel>
+        <Panel title="关键入口" icon={<Home size={18} />}>
+          <div className="quickLinks">
+            {quickEntries.map((entry) => <QuickEntry key={entry.id || entry.label} entry={entry} />)}
+          </div>
+        </Panel>
+      </div>
 
-      <Panel title={problem ? "需要处理" : "基础状态"} icon={<Wrench size={18} />}>
-        <div className="actionBox">
-          <b>{problem ? problem.title : "不用处理"}</b>
-          <p>{problem?.next_action || "当前没有故障域；不要因为过去的偶发波动改网络。"}</p>
-          {problem?.entry && <code>{problem.entry}</code>}
-        </div>
-      </Panel>
+      <div className="actionGrid">
+        <Panel title="关键证据" icon={<Search size={18} />}>
+          <ul className="evidenceList">
+            {incident.evidence.map((item) => <li key={item}>{item}</li>)}
+            {!incident.evidence.length && <li>等待采样。</li>}
+          </ul>
+        </Panel>
 
-      <Panel title="检修通道" icon={<Wifi size={18} />}>
-        <LayerFocus layer={rescue || { title: "Maintenance Wi-Fi", status: state.ops_network?.ok ? "ok" : "unknown", detail: state.ops_network?.ssid || "等待检修网络状态" }} />
-        <p className="note">主网络复杂路径坏了：连检修 Wi-Fi，设备自己开代理访问 Codex，再让 Codex 通过 Pi 排查。</p>
+        <Panel title="检修通道" icon={<Wifi size={18} />}>
+          <div className={`rescueLine ${cls(rescue?.status || (state.ops_network?.ok ? "ok" : "unknown"))}`}>
+            {icon(rescue?.status || (state.ops_network?.ok ? "ok" : "unknown"))}
+            <div>
+              <b>{rescue?.title || "Ops Wi-Fi / Pi"}</b>
+              <p>{rescue?.detail || "主网络复杂路径坏了：设备连检修 Wi-Fi，自己开代理访问 Codex，再让 Codex 进 Pi 排查。"}</p>
+            </div>
+          </div>
+        </Panel>
+      </div>
+
+      <Panel title="详细排查" icon={<Layers3 size={18} />}>
+        <div className="detailHint">
+          <div>
+            <b>首页只给结论。</b>
+            <p>需要看二层、设备 MAC、服务端口、分流规则时，再进上面的拓扑 / 设备 / 分流 / 服务。</p>
+          </div>
+          <span>详细数据不放首页</span>
+        </div>
       </Panel>
     </section>
   );
@@ -473,7 +632,7 @@ function DevicesView({ state, query, setQuery }: { state: State; query: string; 
   const devices = state.devices?.items || [];
   const summary = state.devices?.summary || {};
   const visible = query.trim()
-    ? devices.filter((device) => `${device.ip} ${device.name} ${device.id} ${device.role} ${device.current_mac} ${(device.expected_macs || []).join(" ")}`.toLowerCase().includes(query.trim().toLowerCase()))
+    ? devices.filter((device) => `${device.ip} ${device.current_ip} ${device.name} ${device.id} ${device.role} ${device.current_mac} ${(device.expected_macs || []).join(" ")}`.toLowerCase().includes(query.trim().toLowerCase()))
     : devices;
 
   return (
@@ -680,6 +839,20 @@ function Entry({ entry }: { entry: ConsoleEntry }) {
   );
 }
 
+function QuickEntry({ entry }: { entry: ConsoleEntry }) {
+  const link = links(entry)[0];
+  if (!link) {
+    return <span className={`quickEntry ${cls(entry.status)}`}>{icon(entry.status)}{entry.label || entry.name || entry.id}</span>;
+  }
+  return (
+    <a className={`quickEntry ${cls(entry.status)}`} href={link.href} target="_blank" rel="noreferrer">
+      {icon(entry.status)}
+      <span>{entry.label || entry.name || entry.id}</span>
+      <ArrowUpRight size={13} />
+    </a>
+  );
+}
+
 function ServiceCard({ service }: { service: Service }) {
   const scopes = Array.from(new Set((service.ports || []).map((port) => portScope(port.scope))));
   return (
@@ -703,7 +876,7 @@ function DeviceRow({ device }: { device: Device }) {
       <div className="deviceMain">
         {icon(device.status)}
         <span>
-          <b>{device.ip}</b>
+          <b>{device.current_ip && device.current_ip !== device.ip ? `${device.ip} -> ${device.current_ip}` : device.ip}</b>
           <p>{device.name || device.id} · {device.role || device.network || "device"}</p>
         </span>
         <strong>{label(device.status)}</strong>
